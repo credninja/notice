@@ -134,8 +134,6 @@ notice/
 ├── auth.py                 # Sessions, password hashing, RBAC decorators
 ├── eve_reader.py           # eve.json tail + noise filter
 ├── pipeline.py             # DB ingestion pipeline (daemon thread)
-├── attack_sim.py           # Demo/testing attack simulator
-├── victim_server.py        # Fake vulnerable HTTP service for testing
 │
 ├── analyzers/              # ~40 modules
 │   ├── correlation.py      # Kill-chain phase mapping + attack chain builder
@@ -227,18 +225,6 @@ For a deep-dive on each component (correlation engine, auto-promotion engine, ev
 - **Web framework:** Bottle (single-file, embeddable)
 - **Frontend:** Vanilla JavaScript + D3.js + Chart.js — no build step
 - **Threading:** Threaded WSGI server so long-lived Server-Sent Events streams don't block requests
-- **Testing / demo:** `attack_sim.py` + `victim_server.py` — see `--help` for options
-
-To run the tests / demo:
-```bash
-source venv/bin/activate
-
-# In one terminal — start the fake vulnerable service
-python3 victim_server.py --port 8080
-
-# In another — fire simulated attacks against it
-python3 attack_sim.py --victim <target-ip> --port 8080 --fast
-```
 
 ---
 
