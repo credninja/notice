@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NOTICE — Pipeline & Core Engines Deep Dive</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: #1a1a2e; line-height: 1.55; font-size: 12px; margin: 0; padding: 24px;
+    background: #f5f7fa; max-width: 900px; margin: 0 auto;
+  }
+  h1 {
+    color: #0f172a; font-size: 26px; margin: 0 0 4px 0; letter-spacing: -0.5px;
+    border-bottom: 3px solid #3b82f6; padding-bottom: 10px;
+  }
+  .subtitle { color: #64748b; font-size: 13px; margin-bottom: 30px; }
+  h2 {
+    color: #1e40af; font-size: 18px; margin: 32px 0 12px 0;
+    padding: 8px 0 8px 12px; border-left: 4px solid #3b82f6;
+    background: #eff6ff; page-break-after: avoid;
+  }
+  h3 {
+    color: #1e293b; font-size: 14px; margin: 20px 0 8px 0; page-break-after: avoid;
+  }
+  h4 {
+    color: #334155; font-size: 12.5px; margin: 14px 0 6px 0; page-break-after: avoid;
+    text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;
+  }
+  p { margin: 6px 0 10px 0; }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px;
+    background: #e2e8f0; padding: 1px 5px; border-radius: 3px;
+    color: #be123c;
+  }
+  pre {
+    background: #0f172a; color: #e2e8f0; padding: 12px 16px;
+    border-radius: 6px; font-size: 10.5px; line-height: 1.5;
+    overflow-x: auto; font-family: "SF Mono", Menlo, Consolas, monospace;
+    page-break-inside: avoid;
+    border-left: 3px solid #3b82f6;
+  }
+  pre code { background: none; color: inherit; padding: 0; }
+  .ascii {
+    background: #0f172a; color: #94a3b8; padding: 16px;
+    border-radius: 6px; font-size: 9.5px; line-height: 1.4;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    white-space: pre; page-break-inside: avoid;
+  }
+  table {
+    width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 11px;
+    page-break-inside: avoid;
+  }
+  th {
+    background: #1e40af; color: #fff; padding: 8px 10px; text-align: left;
+    font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px;
+  }
+  td { padding: 6px 10px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+  tr:nth-child(even) td { background: #f8fafc; }
+  .callout {
+    background: #fef9c3; border-left: 4px solid #eab308; padding: 10px 14px;
+    border-radius: 4px; margin: 10px 0; font-size: 11px; color: #713f12;
+  }
+  .callout.info { background: #dbeafe; border-color: #3b82f6; color: #1e3a8a; }
+  .callout.critical { background: #fee2e2; border-color: #dc2626; color: #7f1d1d; }
+  ul, ol { margin: 6px 0 12px 0; padding-left: 22px; }
+  li { margin: 3px 0; }
+  strong { color: #0f172a; }
+  .cover {
+    background: linear-gradient(135deg, #1e40af 0%, #3b82f6 100%);
+    color: white; padding: 40px; border-radius: 8px; margin-bottom: 30px;
+  }
+  .cover h1 { color: white; border-bottom: 2px solid rgba(255,255,255,0.3); }
+  .cover .subtitle { color: rgba(255,255,255,0.85); font-size: 14px; }
+  .cover .meta { font-size: 11px; color: rgba(255,255,255,0.7); margin-top: 20px; }
+  .toc {
+    background: white; border: 1px solid #e2e8f0; border-radius: 6px;
+    padding: 16px 20px; margin-bottom: 30px;
+  }
+  .toc h3 { margin-top: 0; color: #1e40af; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; }
+  .toc ol { margin: 8px 0 0 0; padding-left: 20px; }
+  .toc li { margin: 4px 0; font-size: 11.5px; }
+  .toc a { color: #1e40af; text-decoration: none; }
+  .step-num {
+    display: inline-block; background: #3b82f6; color: white;
+    width: 22px; height: 22px; border-radius: 50%; text-align: center;
+    line-height: 22px; font-weight: 700; font-size: 11px; margin-right: 6px;
+  }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .badge.critical { background: #fee2e2; color: #991b1b; }
+  .badge.high { background: #fef3c7; color: #92400e; }
+  .badge.medium { background: #dbeafe; color: #1e40af; }
+  hr { border: none; border-top: 1px dashed #cbd5e1; margin: 24px 0; }
+  .footer {
+    margin-top: 40px; padding-top: 20px; border-top: 1px solid #e2e8f0;
+    font-size: 10px; color: #94a3b8; text-align: center;
+  }
+  @media print {
+    body { background: white; padding: 0; }
+    .cover { page-break-after: always; }
+    h2 { page-break-before: auto; }
+    pre, .ascii, table, .callout { page-break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <h1>NOTICE Security Platform</h1>
+  <div class="subtitle">Pipeline Architecture &amp; Core Engines — Deep Dive</div>
+  <div class="meta">
+    <div><strong>Document version:</strong> 1.0 · commit d0c0f13 (main)</div>
+    <div><strong>Generated:</strong> 29 July 2026 · IST</div>
+    <div><strong>Scope:</strong> End-to-end data flow, correlation engine, auto-promotion engine, evidence system</div>
+  </div>
+</div>
+
+<div class="toc">
+  <h3>Contents</h3>
+  <ol>
+    <li>End-to-end pipeline overview</li>
+    <li>Data flow — six layers explained</li>
+    <li>Timing &amp; latency characteristics</li>
+    <li>Resilience features</li>
+    <li>Correlation engine — signature → kill chain → attack chain</li>
+    <li>Auto-promotion engine — alerts → incidents</li>
+    <li>Evidence system — chain of custody for POCs</li>
+    <li>Real-world example — SSH brute force end-to-end</li>
+  </ol>
+</div>
+
+<h2>1. End-to-End Pipeline Overview</h2>
+
+<p>NOTICE ingests raw network traffic through Suricata, persists alerts into an indexed SQLite database, enriches them with threat intelligence and kill-chain classification, promotes qualifying alerts into analyst-managed incidents, and exposes everything through a real-time web UI. The entire flow runs on a single host with no external dependencies beyond optional VirusTotal / AbuseIPDB API keys.</p>
+
+<div class="ascii">                    NETWORK (10.1.96.0/23 + others)
+                               |
+              +----------------+----------------+
+              v                                 v
+        +----------+                      +----------+
+        |  enp0s3  |                      |  enp0s8  |
+        |  (local) |                      | (mirror) |
+        +----+-----+                      +----+-----+
+             |                                  |
+             +----------------+----------------+
+                              v  Raw packets
+                +-----------------------------+
+                |  SURICATA (Detection Engine)|
+                |  - Rule matching (~1500)    |
+                |  - Protocol decoding        |
+                |  - Flow tracking            |
+                |  - Threshold aggregation    |
+                +--------------+--------------+
+                               v  Writes JSON events
+                +-----------------------------+
+                |  /var/log/suricata/eve.json |  &lt;-- 2.4 GB, appended
+                +--------------+--------------+
+                               v  Tailed every 2s
+                +-----------------------------+
+                |  pipeline.py (Daemon Thread)|
+                +--------------+--------------+
+                               v  INSERT alerts
+                +-----------------------------+
+                |   SQLite (notice.db)        |
+                |  - ingested_alerts          |
+                |  - incidents                |
+                |  - assets                   |
+                |  - evidence                 |
+                +--+-----------------------+--+
+                   v                       v
+    +----------------------+    +----------------------+
+    | ANALYZERS (async)    |    | BOTTLE WEB SERVER    |
+    | - correlation        |    | (app.py :8080 HTTPS) |
+    | - kill chain phase   |    |                      |
+    | - threat intel       |    | Routes:              |
+    | - GeoIP enrichment   |    | /api/alerts          |
+    | - anomaly detection  |    | /api/incidents       |
+    | - auto-promotion     |    | /api/assets          |
+    +----------------------+    +----------+-----------+
+                                           v
+                                +----------------------+
+                                | BROWSER (SPA)        |
+                                | static/index.html    |
+                                +----------------------+</div>
+
+<h2>2. Data Flow — Six Layers</h2>
+
+<h3><span class="step-num">1</span>Capture Layer (Suricata)</h3>
+<ul>
+  <li>Two interfaces: <code>enp0s3</code> (local traffic) + <code>enp0s8</code> (mirror port)</li>
+  <li>~1,500 detection rules including 35 custom NOTICE rules (SID 1000000–1000799)</li>
+  <li>Rule categories: brute force, port scans, C2 beaconing, malware, MITM, lateral movement</li>
+  <li>Output format: <strong>EVE JSON</strong> (one JSON object per line)</li>
+</ul>
+
+<h3><span class="step-num">2</span>Ingestion Layer (pipeline.py)</h3>
+<ul>
+  <li>Runs as <strong>daemon thread</strong> inside <code>app.py</code></li>
+  <li>Tails <code>eve.json</code> every 2 seconds</li>
+  <li><strong>Byte-offset bookmark</strong> in <code>pipeline_state</code> table survives restarts</li>
+  <li>Detects log rotation via inode change; detects truncation via offset &gt; file size</li>
+  <li>Only <code>event_type=alert</code> events get inserted (flow / dns / http events skipped for performance)</li>
+</ul>
+
+<h3><span class="step-num">3</span>Storage Layer (SQLite WAL mode)</h3>
+<table>
+  <tr><th>Table</th><th>Purpose</th><th>Typical size</th></tr>
+  <tr><td><code>ingested_alerts</code></td><td>All Suricata alerts, indexed by ts/sid/src/dst</td><td>146K+ rows</td></tr>
+  <tr><td><code>incidents</code></td><td>Analyst-managed cases</td><td>23K+ rows</td></tr>
+  <tr><td><code>assets</code></td><td>Passive network discovery</td><td>hundreds</td></tr>
+  <tr><td><code>evidence</code></td><td>File metadata + SHA256</td><td>per-incident</td></tr>
+  <tr><td><code>cache</code></td><td>API response cache with TTL</td><td>KB range</td></tr>
+</table>
+
+<h3><span class="step-num">4</span>Enrichment Layer (Analyzers)</h3>
+<ul>
+  <li><strong>Correlation:</strong> groups alerts into kill chain phases (Recon → Exploitation → C2 → Actions)</li>
+  <li><strong>Threat Intel Queue:</strong> fetches VirusTotal + AbuseIPDB for external IPs (rate-limited)</li>
+  <li><strong>GeoIP:</strong> MaxMind lookup for country / ISP / org</li>
+  <li><strong>Auto-Promotion:</strong> rules that automatically create incidents (severity + IOC threshold + burst detection)</li>
+</ul>
+
+<h3><span class="step-num">5</span>API Layer (Bottle + WSGI)</h3>
+<ul>
+  <li>HTTPS on port 8080 (self-signed cert)</li>
+  <li>Cookie-based session auth (<code>notice_session</code>)</li>
+  <li>RBAC: admin / analyst / viewer roles</li>
+  <li>API keys for programmatic access</li>
+  <li>Server-sent events (SSE) for live alert stream</li>
+  <li>2-minute response cache for expensive queries</li>
+</ul>
+
+<h3><span class="step-num">6</span>Presentation Layer (Vanilla JS SPA)</h3>
+<ul>
+  <li>Single-page app, no framework (pure JS + D3 + Chart.js)</li>
+  <li>Real-time updates via SSE stream</li>
+  <li>Grouped alert view (deduplicated by SID+src+dst)</li>
+  <li>On-demand PCAP retrieval, incident promotion, evidence upload</li>
+</ul>
+
+<h2>3. Timing &amp; Latency</h2>
+<table>
+  <tr><th>Stage</th><th>Typical latency</th></tr>
+  <tr><td>Packet → Suricata alert</td><td>&lt; 10 ms</td></tr>
+  <tr><td>Alert → eve.json write</td><td>&lt; 100 ms</td></tr>
+  <tr><td>eve.json → DB (pipeline)</td><td>≤ 2 seconds</td></tr>
+  <tr><td>DB → UI (live stream)</td><td>&lt; 500 ms</td></tr>
+  <tr><td>DB → UI (grouped view)</td><td>200 – 500 ms</td></tr>
+  <tr><td>Group detail modal open</td><td>~ 300 ms</td></tr>
+</table>
+
+<h2>4. Resilience Features</h2>
+<ul>
+  <li><strong>Bookmark persistence</strong> — pipeline restart resumes from last processed byte</li>
+  <li><strong>Log rotation detection</strong> — inode change OR truncation resets bookmark</li>
+  <li><strong>Connection pool</strong> with <code>busy_timeout=30000</code> (SQLite WAL)</li>
+  <li><strong>Auto-reconnect</strong> — server survives Suricata restart</li>
+  <li><strong>Cache-first TI lookups</strong> — avoid API rate limits</li>
+</ul>
+
+<hr>
+
+<h2>5. Correlation Engine</h2>
+<p><em>File: <code>analyzers/correlation.py</code> · 389 lines</em></p>
+
+<h3>Step 1: Signature → Kill Chain Phase Mapping</h3>
+<p>Each Suricata rule name gets fuzzy-matched against a <code>SIGNATURE_MAP</code> (100+ patterns) to assign it a kill chain phase AND a MITRE ATT&amp;CK technique:</p>
+
+<pre>SIGNATURE_MAP = [
+    {"pattern": "scan",         "phase": 1, "phase_name": "Reconnaissance",
+     "tactic": "TA0043", "technique": "T1046"},
+    {"pattern": "brute",        "phase": 4, "phase_name": "Exploitation",
+     "tactic": "TA0006", "technique": "T1110"},
+    {"pattern": "sql injection","phase": 4, "phase_name": "Exploitation",
+     "tactic": "TA0002", "technique": "T1190"},
+    {"pattern": "webshell",     "phase": 5, "phase_name": "Installation",
+     "tactic": "TA0003", "technique": "T1505.003"},
+    {"pattern": "beacon",       "phase": 6, "phase_name": "Command &amp; Control",
+     "tactic": "TA0011", "technique": "T1071.001"},
+    {"pattern": "exfil",        "phase": 7, "phase_name": "Actions on Objectives",
+     "tactic": "TA0010", "technique": "T1048"},
+]</pre>
+
+<div class="callout info">
+Example: <code>NOTICE LATERAL SSH Brute Force</code> matches pattern <code>"brute"</code> → Phase 4 Exploitation, MITRE T1110 Brute Force.
+</div>
+
+<h3>Step 2: Group Alerts by (attacker, victim) Pair</h3>
+<pre>pairs = defaultdict(lambda: {"alerts":[], "phases_seen":set(), ...})
+for ev in iter_events(event_types={"alert"}, minutes=minutes):
+    key = (src_ip, dst_ip)
+    pairs[key]["alerts"].append(alert_data)
+    pairs[key]["phases_seen"].add(phase)</pre>
+<p>Every alert between the same source and destination gets bundled together into one "attacker → victim" pair.</p>
+
+<h3>Step 3: Chain Detection — Multi-Phase = Real Attack</h3>
+<pre>real_phases = pair["phases_seen"] - {0}   # exclude unmapped
+if len(real_phases) &lt; 2 and len(pair["signatures"]) &lt; 3:
+    continue  # not an attack chain, just noise</pre>
+<p>Need either <strong>2+ different phases</strong> OR <strong>3+ unique signatures in the same phase</strong> to qualify as an attack chain.</p>
+
+<h3>Step 4: Severity Escalation Rules</h3>
+<pre>has_exploitation = 4 in real_phases    # brute force, SQLi, RCE
+has_c2           = 6 in real_phases    # beacon, cobalt strike
+has_exfil        = 7 in real_phases    # data exfil, DNS tunnel
+
+if has_exploitation and (has_c2 or has_exfil):
+    chain_severity = "critical"   # full kill chain observed
+elif has_exploitation:
+    chain_severity = "high"       # attacker got in
+elif max_phase &gt;= 4:
+    chain_severity = "high"
+else:
+    chain_severity = "medium"     # just recon</pre>
+
+<div class="callout critical">
+A chain going <strong>Recon → Exploitation → C2</strong> gets marked <span class="badge critical">critical</span> automatically.
+</div>
+
+<h2>6. Auto-Promotion Engine</h2>
+<p><em>File: <code>analyzers/auto_promote.py</code></em></p>
+
+<p>Runs as a <strong>daemon thread</strong> every N minutes. Evaluates the last window of alerts against user-defined rules stored in <code>auto_promote_rules</code> table.</p>
+
+<h3>Four Criteria Types</h3>
+<table>
+  <tr><th>Criterion</th><th>Behavior</th></tr>
+  <tr><td><code>ti_malicious</code></td><td>Alert's external IP has TI score ≥ threshold (VT + AbuseIPDB, cache-only)</td></tr>
+  <tr><td><code>alert_burst</code></td><td>Same (sid, src_ip) fired ≥ threshold times in window</td></tr>
+  <tr><td><code>killchain_phase</code></td><td>Signature maps to phase ≥ threshold (e.g., ≥ 4 = exploitation)</td></tr>
+  <tr><td><code>critical_asset</code></td><td>Alert touches an asset marked <code>business_critical=1</code></td></tr>
+</table>
+
+<h3>Idempotency Guard (Prevents Duplicates)</h3>
+<pre>existing = conn.execute(
+    "SELECT id FROM incidents WHERE signature_id=? AND attacker_ip=? "
+    "AND victim_ip=? AND created_at &gt; datetime('now','-1 day') "
+    "ORDER BY id DESC LIMIT 1",
+    (sid, src, dst),
+).fetchone()
+if existing:
+    return existing["id"]   # already promoted, don't create duplicate</pre>
+<p>Same <code>(SID, src, dst)</code> within 24 hours = returns existing incident. This is why re-running the sweeper is safe.</p>
+
+<h3>Auto-Seeded IOCs</h3>
+<p>When promotion happens, the incident gets IOCs auto-attached:</p>
+<pre>seed_iocs = [
+    ("src_ip", src),
+    ("dest_ip", dst),
+    ("signature_id", sid),
+    ("signature", sig),
+]</pre>
+<p>These are the "primary" IOCs. Additional auxiliary IOCs get added by the clustering engine (external IPs from related alerts, recurring SIDs, etc.).</p>
+
+<h3>Full Audit Trail</h3>
+<p>Every decision — promoted, skipped, failed — is logged to <code>auto_promote_decisions</code>:</p>
+<pre>CREATE TABLE auto_promote_decisions (
+    rule_id, rule_name, signature_id, src_ip, dest_ip,
+    decision,      -- 'promoted' | 'skipped' | 'failed'
+    reason,        -- e.g., "burst threshold 5 not met (count=3)"
+    incident_id    -- if promoted
+)</pre>
+<p>You can query the DB directly and see exactly why each alert did or didn't become an incident.</p>
+
+<h2>7. Evidence System</h2>
+<p><em>File: <code>routes/case_mgmt.py</code></em></p>
+
+<h3>Storage Layout</h3>
+<pre>/home/notice/Documents/notice/evidence/
+├── 23052/                          ← incident ID
+│   ├── screenshot_1.png
+│   └── pcap_extract.pcap
+├── 23064/
+│   └── attacker_traffic.zip
+└── ...</pre>
+<p>Files stored on <strong>disk</strong> (not in DB — DB only holds metadata + SHA256).</p>
+
+<h3>Upload Flow</h3>
+<pre>@app.post("/api/incidents/&lt;id&gt;/evidence")
+def upload_evidence(incident_id):
+    # 1. Size check (50 MB max)
+    if len(file_data) &gt; MAX_EVIDENCE_SIZE:
+        return {"error": "File exceeds 50MB"}
+
+    # 2. Compute SHA256 (chain of custody hash)
+    h = hashlib.sha256()
+    h.update(file_data)
+    sha = h.hexdigest()
+
+    # 3. Deduplicated filename (adds -1, -2 if collision)
+    save_path = _unique_filename(incident_dir, filename)
+
+    # 4. Write to disk
+    with open(save_path, "wb") as f:
+        f.write(file_data)
+
+    # 5. Insert DB metadata
+    conn.execute("""INSERT INTO evidence
+        (incident_id, filename, file_path, file_size, mime_type,
+         description, hash_sha256, uploaded_by, uploaded_at)
+        VALUES (?,?,?,?,?,?,?,?, datetime('now','localtime'))""", (...))</pre>
+
+<h3>Why SHA256 Matters</h3>
+<div class="callout">
+The hash is stored in DB <strong>and</strong> shown in the report (<code>sha256:9619954b3f69e283…</code>). If someone tampers with the file on disk, the SHA256 in the DB won't match — proving chain of custody was broken. This is what makes evidence admissible for compliance / legal proceedings.
+</div>
+
+<h3>Download / Delete Guards</h3>
+<pre>@app.get(".../evidence/&lt;eid&gt;/download")
+def download_evidence(incident_id, eid):
+    row = conn.execute(
+        "SELECT * FROM evidence WHERE id=? AND incident_id=?",
+        (eid, incident_id)
+    )
+    # Must match BOTH incident_id AND evidence_id
+    # — prevents cross-incident evidence leaks</pre>
+
+<hr>
+
+<h2>8. Real-World Example — SSH Brute Force End-to-End</h2>
+
+<p>Walk-through of the SSH brute force test performed on 2026-07-29:</p>
+
+<table>
+  <tr><th>#</th><th>Stage</th><th>What happens</th></tr>
+  <tr>
+    <td><span class="step-num">1</span></td>
+    <td>Detection</td>
+    <td>Suricata sees 3 SYN packets from <code>10.2.139.119 → 10.1.96.53:22</code> within 120s → fires SID 1000701 alert</td>
+  </tr>
+  <tr>
+    <td><span class="step-num">2</span></td>
+    <td>Ingestion</td>
+    <td><code>pipeline.py</code> picks it up from eve.json in ≤ 2s → inserts into <code>ingested_alerts</code></td>
+  </tr>
+  <tr>
+    <td><span class="step-num">3</span></td>
+    <td>Classification</td>
+    <td>Correlation engine maps signature "SSH Brute Force" → <code>"brute"</code> pattern → Phase 4 Exploitation, MITRE T1110</td>
+  </tr>
+  <tr>
+    <td><span class="step-num">4</span></td>
+    <td>Promotion</td>
+    <td>Auto-promote checks rules: <code>killchain_phase</code> criterion, threshold=4 → MATCHES; severity check: <code>alert.severity=1</code> (critical) → passes floor; creates Incident #23065 with auto-seeded IOCs</td>
+  </tr>
+  <tr>
+    <td><span class="step-num">5</span></td>
+    <td>Evidence</td>
+    <td>Analyst investigates → attaches a screenshot as evidence; SHA256 computed, stored on disk + DB</td>
+  </tr>
+  <tr>
+    <td><span class="step-num">6</span></td>
+    <td>Reporting</td>
+    <td>Analyst marks TP + closes with RCA; daily CSV/PDF report includes: investigation summary, root cause, attached screenshot filename + SHA256</td>
+  </tr>
+</table>
+
+<p>Every step is <strong>auditable</strong> (audit_log + auto_promote_decisions), <strong>idempotent</strong> (24-hour incident dedup), and <strong>survives restarts</strong> (byte-offset bookmark). That's the whole flow.</p>
+
+<div class="footer">
+  NOTICE Security Platform · Pipeline Deep Dive · Generated 2026-07-29
+</div>
+
+</body>
+</html>

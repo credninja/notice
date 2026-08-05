@@ -1,0 +1,170 @@
+# =====================================================================
+# External → Internal detection rule pack
+# =====================================================================
+# Production-ready signatures focused on inbound (EXTERNAL_NET → HOME_NET)
+# attack patterns. SID range 5,500,000 – 5,599,999 is reserved for this
+# pack so it doesn't collide with auto-generated asset rules (1M–2M),
+# user-defined rules (5M–5.5M), or community feeds (2M–3M).
+#
+# Categories covered:
+#   - Reconnaissance / scanning      5,500,000 – 5,500,099
+#   - Brute force                     5,500,100 – 5,500,199
+#   - Exploitation                    5,500,200 – 5,500,299
+#   - Command & Control               5,500,300 – 5,500,399
+#   - Abnormal protocol usage         5,500,400 – 5,500,499
+#
+# Conventions:
+#   - All rules are alert-only (no drop) so an analyst confirms before blocking.
+#   - threshold + flowbits used to avoid alert storms.
+#   - msg prefixes "EXT2INT <CATEGORY>" make filtering trivial in the UI.
+#   - classtype matches Suricata's standard set so existing dashboards group.
+# =====================================================================
+
+# ─── 1. RECONNAISSANCE / SCANNING ────────────────────────────────────
+
+# Horizontal port scan: same external src hits >25 distinct ports on one
+# internal host within 60s. By tracking by_src this catches bursty scans
+# without spamming on a single misbehaving client.
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT SCAN Horizontal port scan from external source"; flags:S; threshold:type both, track by_src, count 25, seconds 60; classtype:attempted-recon; sid:5500001; rev:1;)
+
+# Vertical / host scan: same external src probing many internal hosts on
+# one TCP port within 60s — characteristic of internet-wide scanners
+# (Shodan, Censys, plus targeted ones).
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT SCAN Vertical scan / mass connect from external source"; flags:S; threshold:type both, track by_src, count 50, seconds 60; classtype:attempted-recon; sid:5500002; rev:1;)
+
+# ICMP echo sweep
+alert icmp $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT SCAN ICMP echo sweep from external source"; itype:8; threshold:type both, track by_src, count 20, seconds 60; classtype:attempted-recon; sid:5500003; rev:1;)
+
+# Stealth scans (NULL / FIN / Xmas)
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT SCAN NULL flag scan inbound"; flags:0; classtype:attempted-recon; sid:5500004; rev:1;)
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT SCAN FIN-only scan inbound"; flags:F,12; classtype:attempted-recon; sid:5500005; rev:1;)
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT SCAN Xmas tree scan inbound"; flags:FPU,12; classtype:attempted-recon; sid:5500006; rev:1;)
+
+# SNMP enumeration from external — should never happen
+alert udp $EXTERNAL_NET any -> $HOME_NET 161 (msg:"EXT2INT SCAN External SNMP enumeration attempt"; classtype:attempted-recon; sid:5500007; rev:1;)
+
+# DNS zone-transfer attempt from external
+alert tcp $EXTERNAL_NET any -> $HOME_NET 53 (msg:"EXT2INT SCAN DNS zone transfer (AXFR) attempted from external"; content:"|00 00 fc|"; offset:14; classtype:attempted-recon; sid:5500008; rev:1;)
+
+# LDAP enumeration from external
+alert tcp $EXTERNAL_NET any -> $HOME_NET [389,636,3268,3269] (msg:"EXT2INT SCAN External LDAP query attempt"; classtype:attempted-recon; sid:5500009; rev:1;)
+
+# Common-service probe to a known closed/restricted port range
+alert tcp $EXTERNAL_NET any -> $HOME_NET [135,137,138,139,445] (msg:"EXT2INT SCAN External NetBIOS/SMB probe"; flags:S; threshold:type limit, track by_src, count 1, seconds 30; classtype:attempted-recon; sid:5500010; rev:1;)
+
+
+# ─── 2. BRUTE FORCE ──────────────────────────────────────────────────
+
+# SSH brute force — 6+ TCP SYNs to port 22 from same external src in 60s.
+# Pairs well with auth-log monitoring at the host but catches volume even
+# without endpoint visibility.
+alert tcp $EXTERNAL_NET any -> $HOME_NET 22 (msg:"EXT2INT BRUTEFORCE SSH connection burst from external"; flags:S; threshold:type both, track by_src, count 6, seconds 60; classtype:attempted-user; sid:5500101; rev:1;)
+
+# RDP brute force
+alert tcp $EXTERNAL_NET any -> $HOME_NET 3389 (msg:"EXT2INT BRUTEFORCE RDP connection burst from external"; flags:S; threshold:type both, track by_src, count 6, seconds 60; classtype:attempted-user; sid:5500102; rev:1;)
+
+# SMB / Windows admin (rarely should be exposed externally — anything is suspect)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 445 (msg:"EXT2INT BRUTEFORCE SMB connection burst from external (SMB shouldn't be public)"; flags:S; threshold:type both, track by_src, count 4, seconds 60; classtype:attempted-admin; sid:5500103; rev:1;)
+
+# FTP brute force
+alert tcp $EXTERNAL_NET any -> $HOME_NET 21 (msg:"EXT2INT BRUTEFORCE FTP login burst from external"; content:"USER "; nocase; threshold:type both, track by_src, count 5, seconds 60; classtype:attempted-user; sid:5500104; rev:1;)
+
+# Database direct access from external (MSSQL, MySQL, PostgreSQL, Oracle, MongoDB, Redis, Elasticsearch)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 1433 (msg:"EXT2INT BRUTEFORCE External MSSQL connection (database shouldn't be public)"; flags:S; classtype:attempted-admin; sid:5500105; rev:1;)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 3306 (msg:"EXT2INT BRUTEFORCE External MySQL connection (database shouldn't be public)"; flags:S; classtype:attempted-admin; sid:5500106; rev:1;)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 5432 (msg:"EXT2INT BRUTEFORCE External PostgreSQL connection (database shouldn't be public)"; flags:S; classtype:attempted-admin; sid:5500107; rev:1;)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 1521 (msg:"EXT2INT BRUTEFORCE External Oracle TNS connection (database shouldn't be public)"; flags:S; classtype:attempted-admin; sid:5500108; rev:1;)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 27017 (msg:"EXT2INT BRUTEFORCE External MongoDB connection"; flags:S; classtype:attempted-admin; sid:5500109; rev:1;)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 6379 (msg:"EXT2INT BRUTEFORCE External Redis connection (no auth by default)"; flags:S; classtype:attempted-admin; sid:5500110; rev:1;)
+alert tcp $EXTERNAL_NET any -> $HOME_NET [9200,9300] (msg:"EXT2INT BRUTEFORCE External Elasticsearch connection"; flags:S; classtype:attempted-admin; sid:5500111; rev:1;)
+
+# Web-app credential brute force — POST /login burst from one IP
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT BRUTEFORCE HTTP /login burst from external"; flow:to_server,established; http.method; content:"POST"; http.uri; content:"login"; nocase; threshold:type both, track by_src, count 10, seconds 60; classtype:attempted-user; sid:5500112; rev:1;)
+
+
+# ─── 3. EXPLOITATION ─────────────────────────────────────────────────
+
+# Inbound RDP with EncryptionLevel=0 (BlueKeep / generic RDP exploit prep)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 3389 (msg:"EXT2INT EXPLOIT RDP MS_T120 channel allocation (BlueKeep precursor)"; flow:to_server,established; content:"|03 00 00|"; depth:3; content:"MS_T120"; nocase; classtype:attempted-admin; sid:5500201; rev:1;)
+
+# Eternal Blue / SMBv1 negotiate from external
+alert tcp $EXTERNAL_NET any -> $HOME_NET 445 (msg:"EXT2INT EXPLOIT SMBv1 negotiate from external (EternalBlue family)"; flow:to_server,established; content:"|ff|SMB"; offset:4; depth:4; content:"|72|"; offset:8; depth:1; classtype:attempted-admin; sid:5500202; rev:1;)
+
+# Log4Shell pattern in HTTP/User-Agent
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT EXPLOIT JNDI lookup pattern in HTTP request (Log4Shell family)"; flow:to_server,established; content:"jndi"; nocase; pcre:"/\$\{(jndi|env|sys|ctx|date|lower|upper):/i"; classtype:attempted-admin; sid:5500203; rev:1;)
+
+# Path traversal
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT EXPLOIT Directory traversal attempt in URL"; flow:to_server,established; http.uri; pcre:"/(\.\.[\/\\]){2,}/"; classtype:web-application-attack; sid:5500204; rev:1;)
+
+# SQL injection — UNION SELECT / SLEEP / xp_cmdshell
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT EXPLOIT SQL injection: UNION SELECT in URL/body"; flow:to_server,established; pcre:"/union\s+(all\s+)?select/i"; classtype:web-application-attack; sid:5500205; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT EXPLOIT SQL injection: time-based payload"; flow:to_server,established; pcre:"/(sleep\(\d+\)|benchmark\(|waitfor\s+delay)/i"; classtype:web-application-attack; sid:5500206; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT EXPLOIT SQL injection: xp_cmdshell"; flow:to_server,established; content:"xp_cmdshell"; nocase; classtype:web-application-attack; sid:5500207; rev:1;)
+
+# Command injection
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT EXPLOIT Command injection: shell metacharacters in URL"; flow:to_server,established; http.uri; pcre:"/(\;|\|)\s*(wget|curl|nc|bash|sh|cmd|powershell)\b/i"; classtype:web-application-attack; sid:5500208; rev:1;)
+
+# XSS — inbound script tag
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT EXPLOIT XSS attempt: script tag in URL or body"; flow:to_server,established; pcre:"/<script[\s>]/i"; classtype:web-application-attack; sid:5500209; rev:1;)
+
+# Webshell upload patterns
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT EXPLOIT Webshell upload pattern (eval/exec in body)"; flow:to_server,established; http.method; content:"POST"; content:"<?php"; nocase; pcre:"/<\?php\s+(eval|exec|system|passthru|shell_exec|assert)\s*\(/i"; classtype:web-application-attack; sid:5500210; rev:1;)
+
+# Inbound exec'ed cmd via headers (CGI bash exploit / shellshock)
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT EXPLOIT Shellshock-style payload in HTTP header"; flow:to_server,established; pcre:"/\(\s*\)\s*\{\s*[:_].*?;\s*\}\s*;/H"; classtype:attempted-admin; sid:5500211; rev:1;)
+
+# ProxyShell/ProxyLogon (Exchange) characteristic URLs
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT EXPLOIT Exchange autodiscover with admin@ pattern (ProxyShell precursor)"; flow:to_server,established; http.uri; content:"/autodiscover/autodiscover.json"; nocase; content:"@"; classtype:attempted-admin; sid:5500212; rev:1;)
+
+
+# ─── 4. COMMAND & CONTROL CALLBACKS ──────────────────────────────────
+# Note: most C2 fires on outbound traffic, but we DO see C2-prep / direct
+# operator connections inbound when an attacker is shelling into a victim.
+
+# Reverse shell beacon — short-lived TCP from a single external IP to a
+# specific internal IP, with raw TCP (no app proto) on a non-standard
+# high port. Threshold catches when we see >5 such mini-flows.
+alert tcp $EXTERNAL_NET any -> $HOME_NET [4444,4445,5555,6666,7777,8888,9999,31337] (msg:"EXT2INT C2 Inbound connection on classic reverse-shell port"; flow:established; classtype:trojan-activity; sid:5500301; rev:1;)
+
+# Cobalt Strike default beacon profile — checksum8 Mozilla 4 cookie
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT C2 Cobalt Strike-style beacon URL pattern (checksum8)"; flow:to_server,established; http.uri; pcre:"/^\/(?:\w{4}|\w[A-Za-z0-9_]{3,7})$/"; http.user_agent; content:"Mozilla/4.0 (compatible; MSIE"; classtype:trojan-activity; sid:5500302; rev:1;)
+
+# Known C2 fingerprints — Empire, Metasploit, Sliver, Mythic
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT C2 Empire/PowerShell-Empire user-agent"; flow:to_server,established; http.user_agent; content:"Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0) like Gecko"; classtype:trojan-activity; sid:5500303; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT C2 Metasploit Meterpreter default user-agent"; flow:to_server,established; http.user_agent; content:"Mozilla/4.0 (compatible; MSIE 6.1; Windows NT)"; classtype:trojan-activity; sid:5500304; rev:1;)
+
+# Long-lived TCP without app-protocol identification (classic bot keepalive)
+alert tcp $EXTERNAL_NET any -> $HOME_NET ![21,22,25,53,80,110,123,143,389,443,465,587,993,995,3306,3389,5432,8080,8443] (msg:"EXT2INT C2 Long unrecognized TCP session inbound on uncommon port"; flow:established; threshold:type limit, track by_src, count 1, seconds 600; classtype:trojan-activity; sid:5500305; rev:1;)
+
+# DNS over non-DNS port (DNS tunneling indicator)
+alert udp $EXTERNAL_NET any -> $HOME_NET ![53,5353] (msg:"EXT2INT C2 DNS-shaped traffic on non-DNS port (possible tunneling)"; content:"|01 00 00 01|"; offset:2; depth:4; classtype:trojan-activity; sid:5500306; rev:1;)
+
+
+# ─── 5. ABNORMAL PROTOCOL USAGE ──────────────────────────────────────
+
+# TLS on non-TLS port (encrypted C2 hiding behind oddball ports)
+alert tls $EXTERNAL_NET any -> $HOME_NET ![443,465,587,636,853,989,990,993,995,8443] (msg:"EXT2INT PROTO TLS handshake to non-TLS internal port"; flow:to_server,established; classtype:protocol-command-decode; sid:5500401; rev:1;)
+
+# Plain HTTP on TLS port (downgrade or misconfig from external prober)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 443 (msg:"EXT2INT PROTO Plain HTTP request on port 443 from external"; flow:to_server,established; content:"GET "; depth:4; classtype:protocol-command-decode; sid:5500402; rev:1;)
+
+# RDP on non-3389 port
+alert tcp $EXTERNAL_NET any -> $HOME_NET ![3389] (msg:"EXT2INT PROTO RDP CR-Connect packet on non-RDP port"; flow:to_server,established; content:"|03 00 00 13 0e e0 00 00 00 00 00|"; depth:11; classtype:protocol-command-decode; sid:5500403; rev:1;)
+
+# Telnet inbound — should never happen in 2026
+alert tcp $EXTERNAL_NET any -> $HOME_NET 23 (msg:"EXT2INT PROTO External Telnet connection (deprecated, plaintext credentials)"; flow:to_server,established; classtype:policy-violation; sid:5500404; rev:1;)
+
+# Inbound IRC — typical botnet signaling
+alert tcp $EXTERNAL_NET any -> $HOME_NET [6667,6697] (msg:"EXT2INT PROTO External IRC connection (rare; possible botnet)"; flow:to_server,established; classtype:trojan-activity; sid:5500405; rev:1;)
+
+# SMB null-session probe
+alert tcp $EXTERNAL_NET any -> $HOME_NET 445 (msg:"EXT2INT PROTO SMB null session attempt from external"; flow:to_server,established; content:"|00 00 00 00 ff|SMB"; depth:8; content:"|00|"; distance:80; classtype:attempted-recon; sid:5500406; rev:1;)
+
+# Unicast traffic to a Tor entry-port range (rare reason for external→internal Tor)
+alert tcp $EXTERNAL_NET any -> $HOME_NET [9001,9030,9050,9051,9150] (msg:"EXT2INT PROTO External connection on Tor-typical port"; flow:to_server,established; classtype:policy-violation; sid:5500407; rev:1;)
+
+# Large UDP packet from external to a low-port — amplification reflection target
+alert udp $EXTERNAL_NET any -> $HOME_NET [123,389,1900,11211] (msg:"EXT2INT PROTO Possible amplification reflection target packet"; dsize:>500; classtype:attempted-dos; sid:5500408; rev:1;)
+
+# ICMP destination unreachable burst — covert channel or recon
+alert icmp $EXTERNAL_NET any -> $HOME_NET any (msg:"EXT2INT PROTO ICMP destination-unreachable burst inbound"; itype:3; threshold:type both, track by_src, count 50, seconds 60; classtype:attempted-recon; sid:5500409; rev:1;)

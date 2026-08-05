@@ -1,0 +1,47 @@
+# ── Python ──
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# ── Application data (operational state, not source) ──
+notice.db
+notice.db-shm
+notice.db-wal
+notice.db-journal
+notice.db.backup.*
+notice.db.pre_*
+evidence/
+
+# ── Secrets ──
+.env
+certs/
+*.pem
+*.key
+
+# ── Environment-specific / personal data (don't ship real assessments) ──
+SECURITY_ASSESSMENT.md
+suricata-rules/local.rules
+LOCAL_NOTES.md
+notes/
+
+# ── Local agent / IDE state ──
+.claude/
+.vscode/
+.idea/
+
+# ── Offline GeoLite2 binary databases (auto-downloaded, ~75 MB, weekly refresh) ──
+geolite2/*.mmdb
+geolite2/*.tar.gz
+
+# ── Generated artefacts ──
+*.pdf
+*.log
+/tmp/
+.DS_Store
+Thumbs.db
+
+# Whitelist tracked documentation PDFs
+!DEPLOYMENT.pdf

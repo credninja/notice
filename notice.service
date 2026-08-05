@@ -1,0 +1,31 @@
+[Unit]
+Description=NOTICE - Network Observation & Threat Intelligence Correlation Engine
+Documentation=https://github.com/cybermanthan/notice
+After=network.target suricata.service
+Wants=suricata.service
+
+[Service]
+Type=simple
+User=notice
+Group=notice
+WorkingDirectory=/home/notice/Documents/notice
+Environment=PATH=/home/notice/Documents/notice/venv/bin:/usr/local/bin:/usr/bin
+ExecStart=/home/notice/Documents/notice/venv/bin/python3 /home/notice/Documents/notice/app.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=notice
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/notice/Documents/notice
+ReadOnlyPaths=/var/log/suricata /etc/suricata /var/lib/suricata/rules
+
+# Resource limits
+LimitNOFILE=65535
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

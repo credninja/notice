@@ -1,0 +1,194 @@
+# =====================================================================
+# Asset-Identification & Internal-Risk rule pack
+# =====================================================================
+# Complements the auto-generated per-asset rules. These focus on:
+#   1. Asset DISCOVERY  — new hosts, OS / role fingerprint changes
+#   2. Role drift       — workstation acting like server, server acting odd
+#   3. Identity leakage — NTLM / Kerberos / plaintext-auth signals
+#   4. Insider risk     — privileged ops from non-admin assets, lateral spread
+#   5. Critical-asset tripwires — first-time external-source contact, off-hours
+#   6. Service drift    — asset opens new listening port, new outbound service
+#   7. Shadow-IT / BYOD — unknown internal IPs with significant activity
+#
+# Conventions:
+#   - msg prefix "NOTICE ASSET-ID <CATEGORY>"
+#   - SID range 5,600,000 – 5,699,999  (clear of 1M auto-gen, 2M ETOpen,
+#     5M user rules, 5.5M ext2int pack)
+#   - alert-only; no auto-drop
+#   - threshold/flowbits used aggressively to avoid alert storms
+#   - Most rules don't hardcode IPs — they fire generically on $HOME_NET,
+#     and the NOTICE app maps the alert to the touched asset by IP at
+#     viewing time. Asset-specific rules (with hardcoded IPs) are still
+#     auto-generated separately by /api/monitoring/regenerate-rules.
+# =====================================================================
+
+
+# ─── 1. ASSET DISCOVERY ────────────────────────────────────────────────
+
+# DHCP DISCOVER from internal — gives us the MAC + requested hostname
+# even before the server replies. Useful for detecting rogue devices.
+alert udp $HOME_NET 68 -> any 67 (msg:"NOTICE ASSET-ID DISCOVERY DHCP request from internal source"; flow:to_server; content:"|01 01 06 00|"; depth:4; threshold:type limit, track by_src, count 1, seconds 600; classtype:misc-activity; sid:5600001; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Medium;)
+
+# DHCP REQUEST (option 53 = 3) — host actively requesting an address.
+# Pairs with NIDS host-tracker to confirm a live asset.
+alert udp $HOME_NET 68 -> any 67 (msg:"NOTICE ASSET-ID DISCOVERY DHCP request — live host on the wire"; flow:to_server; content:"|35 01 03|"; threshold:type limit, track by_src, count 1, seconds 600; classtype:misc-activity; sid:5600002; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Medium;)
+
+# NetBIOS Name-Service announcement — Windows machines self-announce here
+alert udp $HOME_NET any -> $HOME_NET 137 (msg:"NOTICE ASSET-ID DISCOVERY NetBIOS name announcement (Windows host fingerprint)"; flow:to_server; content:"|29 01 00 00 00 01|"; depth:6; threshold:type limit, track by_src, count 1, seconds 1800; classtype:misc-activity; sid:5600003; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Medium;)
+
+# mDNS / Bonjour — typical of macOS, IoT, printers
+alert udp $HOME_NET any -> 224.0.0.251 5353 (msg:"NOTICE ASSET-ID DISCOVERY mDNS broadcast (Apple/IoT/printer fingerprint)"; threshold:type limit, track by_src, count 1, seconds 1800; classtype:misc-activity; sid:5600004; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Medium;)
+
+# SSDP / UPnP — common on home/IoT gear; rare on managed enterprise endpoints
+alert udp $HOME_NET any -> 239.255.255.250 1900 (msg:"NOTICE ASSET-ID DISCOVERY SSDP/UPnP traffic (consumer-grade or IoT device)"; threshold:type limit, track by_src, count 1, seconds 600; classtype:misc-activity; sid:5600005; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence High;)
+
+# LLMNR — Windows fallback name resolution. Often a poisoning indicator
+# OR an unmanaged Windows host. Either way: useful asset signal.
+alert udp $HOME_NET any -> 224.0.0.252 5355 (msg:"NOTICE ASSET-ID DISCOVERY LLMNR query (Windows host w/ default name resolution)"; threshold:type limit, track by_src, count 5, seconds 60; classtype:misc-activity; sid:5600006; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence High;)
+
+
+# ─── 2. ROLE DRIFT ─────────────────────────────────────────────────────
+
+# Internal host suddenly answering on SSH from an internal source —
+# i.e. acting as a server. If the host is asset_type='workstation' in the
+# DB, this is a real role drift.
+alert tcp $HOME_NET 22 -> $HOME_NET any (msg:"NOTICE ASSET-ID DRIFT Internal host accepting SSH (server-role behavior)"; flow:established,from_server; flags:S,12; threshold:type limit, track by_src, count 1, seconds 600; classtype:protocol-command-decode; sid:5600101; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Internal, confidence Medium;)
+
+# Internal host listening on RDP — workstations should rarely accept inbound RDP
+alert tcp $HOME_NET 3389 -> $HOME_NET any (msg:"NOTICE ASSET-ID DRIFT Internal host accepting RDP (verify host role)"; flow:established,from_server; threshold:type limit, track by_src, count 1, seconds 600; classtype:protocol-command-decode; sid:5600102; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Internal, confidence Medium;)
+
+# Internal host responding on SMB (445) — it's a file server or it shouldn't be
+alert tcp $HOME_NET 445 -> $HOME_NET any (msg:"NOTICE ASSET-ID DRIFT Internal host responding on SMB (file-server role)"; flow:established,from_server; threshold:type limit, track by_src, count 1, seconds 1800; classtype:protocol-command-decode; sid:5600103; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Medium;)
+
+# Internal host listening on database ports — should NEVER happen on a workstation
+alert tcp $HOME_NET [1433,3306,5432,1521,27017,6379,5984,9042] -> $HOME_NET any (msg:"NOTICE ASSET-ID DRIFT Internal host responding on a DB port"; flow:established,from_server; threshold:type limit, track by_src, count 1, seconds 1800; classtype:protocol-command-decode; sid:5600104; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Internal, confidence High;)
+
+# Workstation initiating SQL — should usually be servers/apps, not endpoints
+alert tcp $HOME_NET any -> $HOME_NET [1433,3306,5432,1521] (msg:"NOTICE ASSET-ID DRIFT Internal host initiating direct DB connection — verify it's not a workstation"; flow:to_server; flags:S,12; threshold:type both, track by_src, count 5, seconds 600; classtype:misc-activity; sid:5600105; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Medium;)
+
+# Internal HTTP server suddenly listening on a NON-standard port — drift signal
+alert http $HOME_NET ![80,443,8080,8443,3000,4200,5000,5173,8000,8888,9000] -> any any (msg:"NOTICE ASSET-ID DRIFT Internal HTTP server on uncommon port — possible shadow service"; flow:from_server,established; threshold:type limit, track by_src, count 1, seconds 1800; classtype:protocol-command-decode; sid:5600106; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Medium;)
+
+
+# ─── 3. IDENTITY & CREDENTIAL EXPOSURE ─────────────────────────────────
+
+# NTLM authentication leaving the network — credentials must NEVER egress.
+# Catches both raw NTLMSSP in TCP and HTTP-Negotiate(NTLM).
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID IDENTITY NTLM authentication egressing to external host (credential exposure)"; flow:to_server,established; content:"NTLMSSP|00|"; threshold:type limit, track by_src, count 1, seconds 600; classtype:credential-theft; sid:5600201; rev:1; metadata:created_at 2026_05_05, signature_severity Critical, deployment Perimeter, confidence High; reference:url,attack.mitre.org/techniques/T1557;)
+
+# HTTP Authorization: NTLM going outbound
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID IDENTITY HTTP NTLM Authorization to external host"; flow:to_server,established; http.header_names; content:"Authorization"; nocase; http.header; content:"NTLM "; nocase; threshold:type limit, track by_src, count 1, seconds 600; classtype:credential-theft; sid:5600202; rev:1; metadata:created_at 2026_05_05, signature_severity Critical, deployment Perimeter, confidence High;)
+
+# HTTP Basic auth outbound to external — plaintext credentials
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID IDENTITY HTTP Basic auth (plaintext) leaving network"; flow:to_server,established; http.header_names; content:"Authorization"; nocase; http.header; content:"Basic "; nocase; classtype:credential-theft; sid:5600203; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Perimeter, confidence High;)
+
+# Kerberos AS-REQ to external host — Kerberos shouldn't traverse the perimeter
+alert udp $HOME_NET any -> $EXTERNAL_NET 88 (msg:"NOTICE ASSET-ID IDENTITY Kerberos AS-REQ to external host"; flow:to_server; threshold:type limit, track by_src, count 1, seconds 600; classtype:policy-violation; sid:5600204; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Perimeter, confidence High;)
+alert tcp $HOME_NET any -> $EXTERNAL_NET 88 (msg:"NOTICE ASSET-ID IDENTITY Kerberos TCP to external host"; flow:to_server,established; threshold:type limit, track by_src, count 1, seconds 600; classtype:policy-violation; sid:5600205; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Perimeter, confidence High;)
+
+# Username pattern in URL or body (looks like leakage of sAMAccountName)
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID IDENTITY Likely username/email leak in outbound HTTP body"; flow:to_server,established; http.method; content:"POST"; pcre:"/(username|user|email|userid|sAMAccountName|principal)\s*[=:]\s*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/i"; threshold:type limit, track by_src, count 1, seconds 600; classtype:policy-violation; sid:5600206; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Low;)
+
+# AS-REQ pre-auth NOT required (RC4 enabled) — kerberoasting precursor
+alert udp $HOME_NET any -> $HOME_NET 88 (msg:"NOTICE ASSET-ID IDENTITY Kerberos AS-REQ with RC4 etype (kerberoasting precursor)"; content:"|a0 1b 30 19 a0 03 02 01 17|"; threshold:type both, track by_src, count 5, seconds 600; classtype:credential-theft; sid:5600207; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Internal, confidence Medium;)
+
+# LDAP simple bind in cleartext — Windows AD over plaintext LDAP
+alert tcp $HOME_NET any -> $HOME_NET 389 (msg:"NOTICE ASSET-ID IDENTITY LDAP simple bind in cleartext (consider LDAPS)"; flow:to_server,established; content:"|60|"; depth:1; pcre:"/^.{0,32}\x80/"; threshold:type limit, track by_src, count 1, seconds 600; classtype:policy-violation; sid:5600208; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Low;)
+
+
+# ─── 4. INSIDER RISK / LATERAL ─────────────────────────────────────────
+
+# One internal IP touching SMB on >5 distinct internal targets in 5 minutes
+# = lateral movement / credential reuse signal.
+alert tcp $HOME_NET any -> $HOME_NET 445 (msg:"NOTICE ASSET-ID INSIDER One source hitting SMB on 5+ targets (lateral movement)"; flow:to_server,established; threshold:type both, track by_src, count 5, seconds 300; classtype:attempted-admin; sid:5600301; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Internal, confidence Medium;)
+
+# WinRM (5985/5986) from a workstation — admin tool typically, used in lateral
+alert tcp $HOME_NET any -> $HOME_NET [5985,5986] (msg:"NOTICE ASSET-ID INSIDER WinRM connection inbound (PowerShell remoting / lateral)"; flow:to_server,established; flags:S,12; threshold:type limit, track by_src, count 1, seconds 600; classtype:attempted-admin; sid:5600302; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Internal, confidence Medium; reference:url,attack.mitre.org/techniques/T1021/006;)
+
+# Internal SSH between hosts that aren't servers — workstation→workstation SSH is rare
+alert tcp $HOME_NET any -> $HOME_NET 22 (msg:"NOTICE ASSET-ID INSIDER Internal SSH session — verify both endpoints are servers"; flow:established,to_server; flags:S,12; threshold:type both, track by_src, count 3, seconds 300; classtype:attempted-user; sid:5600303; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Low;)
+
+# RDP between internal hosts (not from a known jump-host) — admin or insider risk
+alert tcp $HOME_NET any -> $HOME_NET 3389 (msg:"NOTICE ASSET-ID INSIDER Internal RDP connection (verify source is a jump host)"; flow:to_server,established; flags:S,12; threshold:type both, track by_src, count 1, seconds 600; classtype:attempted-admin; sid:5600304; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Low;)
+
+# Multiple distinct external destinations for the same internal source on
+# the same minute = anomaly (data exfil, scanning, beacon storm)
+alert ip $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID INSIDER Internal host connecting to many distinct external hosts (potential exfil / scanner)"; flow:established,to_server; threshold:type both, track by_src, count 200, seconds 60; classtype:misc-activity; sid:5600305; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Low;)
+
+# Privileged-share access by 5+ distinct sources — pass-the-hash pattern
+alert tcp $HOME_NET any -> $HOME_NET 445 (msg:"NOTICE ASSET-ID INSIDER ADMIN$ / C$ share accessed by many distinct sources (pass-the-hash pattern)"; flow:to_server,established; content:"|ff|SMB"; content:"|24 00|"; pcre:"/(ADMIN\$|C\$)/"; threshold:type both, track by_dst, count 5, seconds 600; classtype:attempted-admin; sid:5600306; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Internal, confidence Medium;)
+
+
+# ─── 5. CRITICAL-ASSET TRIPWIRES ───────────────────────────────────────
+# These fire on inbound to common server roles WITHOUT a prior outbound
+# connection — i.e. unsolicited inbound. Pair with auto-generated
+# per-asset rules for hardened protection of business-critical hosts.
+
+# Unsolicited inbound to internal HTTP server from external — first step of recon
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"NOTICE ASSET-ID TRIPWIRE Unsolicited HTTP request from external to internal asset"; flow:to_server,established; http.method; threshold:type limit, track by_dst, count 1, seconds 1800; classtype:attempted-recon; sid:5600401; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Medium;)
+
+# First TLS handshake from a never-before-seen external IP to an internal
+# host (relies on threshold to ignore the noise; analyst reviews the asset)
+alert tls $EXTERNAL_NET any -> $HOME_NET any (msg:"NOTICE ASSET-ID TRIPWIRE External-source TLS handshake to internal asset"; flow:to_server,established; threshold:type limit, track by_src, count 1, seconds 3600; classtype:attempted-recon; sid:5600402; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Low;)
+
+# ICMP echo from external to internal — maps the attack surface
+alert icmp $EXTERNAL_NET any -> $HOME_NET any (msg:"NOTICE ASSET-ID TRIPWIRE External ICMP echo to internal asset (perimeter probe)"; itype:8; threshold:type both, track by_dst, count 3, seconds 300; classtype:attempted-recon; sid:5600403; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Medium;)
+
+# After-hours admin access (relies on event time, evaluated externally —
+# this rule just flags the SMB+admin-share usage; downstream off-hours
+# enrichment in the app marks it suspicious if outside work hours).
+alert tcp $HOME_NET any -> $HOME_NET 445 (msg:"NOTICE ASSET-ID TRIPWIRE Admin-share access (off-hours analysis applied downstream)"; flow:to_server,established; content:"|ff|SMB"; pcre:"/(ADMIN\$|C\$)/"; threshold:type limit, track by_src, count 1, seconds 60; classtype:attempted-admin; sid:5600404; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Low;)
+
+
+# ─── 6. SERVICE DRIFT DETECTION ────────────────────────────────────────
+
+# Internal asset establishes a NEW outbound port that hasn't been seen
+# from it before — useful for spotting unusual application installs
+# (Telegram, Discord, Tor, mining clients).
+
+# Tor connection patterns — direct ORPort
+alert tcp $HOME_NET any -> $EXTERNAL_NET [9001,9030,9050,9051,9150] (msg:"NOTICE ASSET-ID SERVICE-DRIFT Internal asset connecting to Tor port"; flow:to_server,established; threshold:type limit, track by_src, count 1, seconds 600; classtype:policy-violation; sid:5600501; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Perimeter, confidence Medium;)
+
+# IRC chat protocol — almost never legitimate; commonly used for botnets
+alert tcp $HOME_NET any -> $EXTERNAL_NET [6667,6697,7000,7666] (msg:"NOTICE ASSET-ID SERVICE-DRIFT Internal asset using IRC (rare; review)"; flow:to_server,established; threshold:type limit, track by_src, count 1, seconds 600; classtype:trojan-activity; sid:5600502; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Perimeter, confidence Medium;)
+
+# Cryptocurrency mining stratum protocol
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID SERVICE-DRIFT Stratum mining protocol JSON-RPC subscribe"; flow:to_server,established; content:"\"method\""; content:"\"mining.subscribe\""; nocase; classtype:policy-violation; sid:5600503; rev:1; metadata:created_at 2026_05_05, signature_severity Major, deployment Perimeter, confidence High; reference:url,attack.mitre.org/techniques/T1496;)
+
+# Telegram bot API
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID SERVICE-DRIFT Telegram bot API call (potential C2 or BYOD)"; flow:to_server,established; http.host; content:"api.telegram.org"; nocase; threshold:type limit, track by_src, count 1, seconds 600; classtype:policy-violation; sid:5600504; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Medium;)
+
+# Discord webhook URL pattern — used by both legitimate apps and malware C2
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID SERVICE-DRIFT Discord webhook URL accessed (potential C2 or BYOD)"; flow:to_server,established; http.host; content:"discord.com"; http.uri; content:"/api/webhooks/"; threshold:type limit, track by_src, count 1, seconds 600; classtype:policy-violation; sid:5600505; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Medium;)
+
+# Pastebin / file-sharing access — common exfil channel
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID SERVICE-DRIFT Pastebin / file-sharing site accessed from internal asset"; flow:to_server,established; http.host; pcre:"/(pastebin\.com|paste\.ee|hastebin\.com|0bin\.net|justpaste\.it|ghostbin\.com|controlc\.com|filebin\.net|transfer\.sh|file\.io)/i"; threshold:type limit, track by_src, count 1, seconds 1800; classtype:policy-violation; sid:5600506; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Medium;)
+
+# DNS-over-HTTPS / DNS-over-TLS to non-corporate resolvers — bypass detection
+alert dns $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID SERVICE-DRIFT DoH/DoT query to public resolver (corp-DNS bypass)"; threshold:type limit, track by_src, count 1, seconds 600; flow:to_server; classtype:policy-violation; sid:5600507; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Low;)
+alert tls $HOME_NET any -> $EXTERNAL_NET 853 (msg:"NOTICE ASSET-ID SERVICE-DRIFT DNS-over-TLS to public resolver (port 853)"; flow:to_server,established; threshold:type limit, track by_src, count 1, seconds 600; classtype:policy-violation; sid:5600508; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence High;)
+
+
+# ─── 7. SHADOW IT / BYOD ───────────────────────────────────────────────
+# Best-effort detection of unmanaged devices. The NOTICE app cross-checks
+# alert source IPs against the registered asset DB; if there's no entry,
+# it's flagged as "unidentified". These rules generate the signal that
+# triggers the cross-check.
+
+# DHCP request that includes vendor class identifier (option 60) for
+# common BYOD platforms — Apple, Android, Linux distros.
+alert udp $HOME_NET 68 -> any 67 (msg:"NOTICE ASSET-ID BYOD DHCP request with Apple vendor class (iPhone/iPad/Mac)"; flow:to_server; content:"|3c|"; content:"MSFT 5.0|00|"; nocase; offset:240; classtype:policy-violation; sid:5600601; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Internal, confidence Low;)
+
+# User-agent fingerprints for personal mobile devices
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID BYOD Mobile-OS user-agent (iPhone) from corporate network"; flow:to_server,established; http.user_agent; pcre:"/iPhone OS [\d_]+ like Mac OS X/i"; threshold:type limit, track by_src, count 1, seconds 1800; classtype:policy-violation; sid:5600602; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Medium;)
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID BYOD Mobile-OS user-agent (Android) from corporate network"; flow:to_server,established; http.user_agent; content:"Android "; nocase; pcre:"/Android \d/i"; threshold:type limit, track by_src, count 1, seconds 1800; classtype:policy-violation; sid:5600603; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Medium;)
+
+# JA4 fingerprints for personal-OS browsers (Chrome on macOS personal builds, Safari)
+# would go here when JA4 enrichment is enabled — placeholder message rule.
+alert tls $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID BYOD TLS ALPN list typical of consumer browser builds"; flow:to_server,established; tls.alpn; content:"h2"; tls.alpn; content:"http/1.1"; threshold:type limit, track by_src, count 50, seconds 60; classtype:misc-activity; sid:5600604; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Low;)
+
+# Steam / Epic / gaming platform — clearly personal
+alert tls $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID BYOD Gaming-platform SNI (Steam/Epic/Xbox)"; flow:to_server,established; tls.sni; pcre:"/(steam(community|content|powered)?\.com|epicgames\.com|xboxlive\.com|playstation\.net|battle\.net)$/i"; threshold:type limit, track by_src, count 1, seconds 1800; classtype:policy-violation; sid:5600605; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence High;)
+
+# Cloud personal-storage SNI (Dropbox personal, MEGA, pCloud)
+alert tls $HOME_NET any -> $EXTERNAL_NET any (msg:"NOTICE ASSET-ID BYOD Personal cloud-storage SNI (Dropbox/MEGA/pCloud)"; flow:to_server,established; tls.sni; pcre:"/(dropbox\.com|mega\.nz|pcloud\.com|sync\.com|tresorit\.com)$/i"; threshold:type limit, track by_src, count 1, seconds 1800; classtype:policy-violation; sid:5600606; rev:1; metadata:created_at 2026_05_05, signature_severity Informational, deployment Perimeter, confidence Medium;)

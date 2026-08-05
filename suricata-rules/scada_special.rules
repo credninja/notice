@@ -1,0 +1,69 @@
+# Emerging Threats Pro
+#   http://www.emergingthreatspro.com
+#
+# This distribution may contain rules under three different licenses. 
+#
+#  Rules with sids 1 through 3464, and 100000000 through 100000908 are under the GPLv2.
+#  A copy of that license is available at http://www.gnu.org/licenses/gpl-2.0.html
+#
+#  Rules with sids 2000000 through 2799999 are from Emerging Threats and are covered under the BSD License 
+#  as follows:
+#
+#*************************************************************
+#  Copyright (c) 2003-2026, Emerging Threats
+#  All rights reserved.
+#  
+#  Redistribution and use in source and binary forms, with or without modification, are permitted provided that the 
+#  following conditions are met:
+#  
+#  * Redistributions of source code must retain the above copyright notice, this list of conditions and the following 
+#    disclaimer.
+#  * Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the 
+#    following disclaimer in the documentation and/or other materials provided with the distribution.
+#  * Neither the name of the nor the names of its contributors may be used to endorse or promote products derived 
+#    from this software without specific prior written permission.
+#  
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS AS IS AND ANY EXPRESS OR IMPLIED WARRANTIES, 
+#  INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE 
+#  DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
+#  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR 
+#  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, 
+#  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE 
+#  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. 
+#
+#*************************************************************
+#
+#
+#  Rules with sids 2800000 through 2900000 are provided by Emerging Threats Pro and are covered by the license
+#  provided in this distribution titled ETPRO-License.txt
+#
+#
+
+# This Ruleset is EmergingThreats Pro optimized for suricata-5.0-enhanced.
+
+#alert tcp !$DNP3_CLIENT any -> $DNP3_SERVER $DNP3_PORTS (msg:"ETPRO SCADA_SPECIAL DNP3 Unauthorized Write Request to a PLC"; flow:from_client,established; content:"|05 64|"; depth:2; pcre:"/[\S\s]{10}(\x02|\x04|\x05|\x06|\x09|\x0A|\x0F|\x12)/iAR"; reference:url,digitalbond.com/tools/quickdraw/dnp3-rules; classtype:bad-unknown; sid:2801700; rev:1; metadata:created_at 2011_03_22, signature_severity Unknown, updated_at 2019_07_26;)
+
+#alert tcp !$DNP3_CLIENT any -> $DNP3_SERVER $DNP3_PORTS (msg:"ETPRO SCADA_SPECIAL DNP3 Unauthorized Miscellaneous Request to a PLC"; flow:from_client,established; content:"|05 64|"; depth:2; pcre:"/[\S\s]{10}(\x03|\x07|\x08|\x0B|\x0C|\x10|\x11|\x13|\x14|\x15|\x16|\x17|\x18|\x19|\x1A|\x1B|\x1C|\x1D|\x1E)/iAR"; reference:url,digitalbond.com/tools/quickdraw/dnp3-rules; classtype:bad-unknown; sid:2801701; rev:1; metadata:created_at 2011_03_22, signature_severity Unknown, updated_at 2019_07_26;)
+
+#alert tcp $DNP3_CLIENT any -> $DNP3_SERVER $DNP3_PORTS (msg:"ETPRO SCADA_SPECIAL DNP3 Broadcast Request from Authorized Client"; flow:from_client,established; content:"|FF FF|"; offset:4; depth:2; reference:url,digitalbond.com/tools/quickdraw/dnp3-rules; classtype:misc-attack; sid:2801704; rev:1; metadata:created_at 2011_03_22, signature_severity Unknown, updated_at 2019_07_26;)
+
+#alert tcp !$DNP3_CLIENT any -> $DNP3_SERVER $DNP3_PORTS (msg:"ETPRO SCADA_SPECIAL DNP3 Broadcast Request from Unauthorized Client"; flow:from_client,established; content:"|FF FF|"; offset:4; depth:2; reference:url,digitalbond.com/tools/quickdraw/dnp3-rules; classtype:misc-attack; sid:2801705; rev:1; metadata:created_at 2011_03_22, signature_severity Unknown, updated_at 2019_07_26;)
+
+#alert tcp $DNP3_SERVER $DNP3_PORTS -> any any (msg:"ETPRO SCADA_SPECIAL DNP3 Points List Scan"; flow:established; content:"|81|"; offset:12; depth:1; pcre:"/[\S\s]{1}(\x02|\x04|\x06|\x0a|\x0c|\x0e)/iAR"; threshold: type threshold, track by_src, count 5, seconds 30; reference:url,digitalbond.com/tools/quickdraw/dnp3-rules; classtype:attempted-recon; sid:2801706; rev:1; metadata:created_at 2011_03_22, signature_severity Informational, updated_at 2019_07_26;)
+
+#alert tcp $DNP3_SERVER $DNP3_PORTS -> any any (msg:"ETPRO SCADA_SPECIAL DNP3 Function Code Scan"; flow:established; content:"|81|"; offset:12; depth:1; pcre:"/[\S\s]{1}(\x01)/iAR"; threshold: type threshold, track by_src, count 3, seconds 60; reference:url,digitalbond.com/tools/quickdraw/dnp3-rules; classtype:attempted-recon; sid:2801707; rev:1; metadata:created_at 2011_03_22, signature_severity Informational, updated_at 2019_07_26;)
+
+#alert tcp $DNP3_SERVER $DNP3_PORTS -> $DNP3_CLIENT any (msg:"ETPRO SCADA_SPECIAL DNP3 Unsolicited Response Storm"; flow:established; content:"|82|"; offset:12; depth:1; threshold: type threshold, track by_src, count 5, seconds 10; reference:url,digitalbond.com/tools/quickdraw/dnp3-rules; classtype:attempted-dos; sid:2801696; rev:2; metadata:created_at 2011_03_22, signature_severity Informational, updated_at 2019_07_26;)
+
+#alert tcp any any -> $HOME_NET 20000 (msg:"ETPRO SCADA_SPECIAL CONTROL MICROSYSTEMS (Event 31) Reboot or Restart"; dnp3_func:13; classtype:misc-activity; sid:2801004; rev:3; metadata:created_at 2010_12_22, signature_severity Informational, tag Description_Generated_By_Proofpoint_Nexus, updated_at 2019_07_26;)
+
+#alert tcp any any -> $HOME_NET 20000 (msg:"ETPRO SCADA_SPECIAL CONTROL MICROSYSTEMS (Event 31) Reboot or Restart"; dnp3_func:14; classtype:misc-activity; sid:2801005; rev:3; metadata:created_at 2010_12_22, signature_severity Informational, tag Description_Generated_By_Proofpoint_Nexus, updated_at 2019_07_26;)
+
+#alert tcp any 20000 -> $HOME_NET any (msg:"ETPRO SCADA_SPECIAL PROSOFT (Event 20) Function Not Available Error"; flow:established; dnp3_ind:no_func_code_support; classtype:misc-activity; sid:2801094; rev:3; metadata:created_at 2010_12_22, signature_severity Informational, tag Description_Generated_By_Proofpoint_Nexus, updated_at 2019_07_26;)
+
+#alert tcp any 20000 -> $HOME_NET any (msg:"ETPRO SCADA_SPECIAL PROSOFT (Event 21) Point Not Available"; flow:established,to_client; dnp3_ind:object_unknown; classtype:misc-activity; sid:2801095; rev:3; metadata:created_at 2010_12_22, signature_severity Informational, tag Description_Generated_By_Proofpoint_Nexus, updated_at 2019_07_26;)
+
+#alert tcp any any -> $HOME_NET 20000 (msg:"ETPRO SCADA_SPECIAL SCHWEITZER (Event 33) Date Change Attempt"; content:"PleaseStopEnablingPM"; classtype:misc-activity; sid:2801169; rev:3; metadata:created_at 2010_12_22, signature_severity Informational, tag Description_Generated_By_Proofpoint_Nexus, updated_at 2019_07_26;)
+
+#alert tcp any any -> $HOME_NET 20000 (msg:"ETPRO SCADA_SPECIAL SCHWEITZER (Event 24) View Device Status"; dnp3_func:1; classtype:misc-activity; sid:2801171; rev:3; metadata:created_at 2010_12_22, signature_severity Informational, tag Description_Generated_By_Proofpoint_Nexus, updated_at 2019_07_26;)
+

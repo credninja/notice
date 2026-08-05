@@ -1,0 +1,105 @@
+# Notice — Network Security Monitor
+
+Web-based tool for visualizing, analyzing, and investigating IDS network traffic logs.
+
+## Setup
+
+    python3 -m venv --without-pip venv
+    source venv/bin/activate
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3
+    pip install -r requirements.txt
+
+## Run
+
+    source venv/bin/activate
+    python3 app.py
+
+Open https://localhost:8080 (self-signed cert, accept the warning)
+
+To disable HTTPS:
+
+    python3 app.py --no-ssl
+
+## Configuration
+
+Environment variables:
+
+    EVE_LOG      Path to eve.json (default: /var/log/suricata/eve.json)
+    PORT         Server port (default: 8080)
+    MAX_LINES    Max log lines to parse from tail (default: 200000)
+
+## Features
+
+### Network Graph
+- Interactive D3.js force-directed graph
+- Internal (green) vs external (amber) host classification
+- Alert-associated nodes/links in red
+- Click to isolate connections, drag, zoom, filter by IP
+
+### Security Events
+- IDS alert dashboard with severity breakdown
+- Timeline view, top signatures, full alert log
+
+### Plaintext Detection
+- HTTP (port 80), FTP (credentials visible!), SMTP
+- Weak SNMP communities (public, private, iiit123)
+- Deprecated TLS (v1.0, v1.1)
+
+### IP Investigation
+- Full activity timeline for any IP address
+- Risk indicators, connections, DNS queries, TLS sessions
+- SSH events (detects Nmap scanning), file transfers
+
+### Anomaly Detection
+- Nmap scanning detection
+- High-volume flow identification (>50MB)
+- DNS anomalies (long domains, NXDOMAIN floods)
+- Deprecated TLS, unusual ports, app-layer anomalies
+
+### Asset Management
+- Identified vs unidentified internal host tracking
+- Coverage percentage bar
+- Register, edit, delete assets with owner/hostname/department
+- One-click investigate or register from unidentified list
+
+### Incident Management
+- Create cases with severity and status tracking
+- Attach events and investigation notes
+- Status workflow: Open > Investigating > Resolved > Closed
+
+### Policy Engine
+- 6 default rules (no plaintext HTTP, no FTP, weak SNMP, etc.)
+- On-demand policy scan with violation detection
+- Create incidents from violations
+
+## HTTPS
+
+Self-signed certificate is auto-generated in certs/ on first setup.
+To regenerate:
+
+    openssl req -x509 -newkey rsa:2048 -keyout certs/key.pem \
+      -out certs/cert.pem -days 365 -nodes -subj "/CN=notice.local"
+
+## Project Structure
+
+    app.py               Bottle entry point, HTTPS server
+    eve_reader.py        Shared eve.json reader (tail_lines, iter_events)
+    db.py                SQLite schema, cache, default seeds
+    analyzers/
+      plaintext.py       Plaintext protocol detection
+      anomaly.py         Anomaly detection engine
+      policy.py          Policy rule evaluation
+    routes/
+      graph.py           /api/graph, /api/summary
+      security.py        /api/alerts
+      plaintext.py       /api/plaintext
+      investigate.py     /api/investigate/<ip>
+      anomalies.py       /api/anomalies
+      incidents.py       /api/incidents (CRUD)
+      policies.py        /api/policies, /api/policies/scan
+      assets.py          /api/assets, /api/assets/discovery
+    static/
+      index.html         Tabbed SPA (8 views)
+    certs/               Self-signed TLS certificate
+    requirements.txt     Python dependencies (bottle)
+    venv/                Python virtual environment
