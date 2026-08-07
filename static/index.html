@@ -3293,21 +3293,29 @@ async function loadIncidents(){
     _loadDailyReport(); return;
   }
 
-  // Incidents Queue
+  // Incidents Queue — counts are for ACTIVE (non-closed) work.
+  // Closed incidents are only shown under the Closed tab.
+  const _me = (currentUser && currentUser.username) || '';
+  const _cntActive = d.incidents.filter(i => i.status !== 'closed').length;
+  const _cntOpen = d.incidents.filter(i => i.status === 'open' && (!i.phase || i.phase === 'triage')).length;
+  const _cntInvestigating = d.incidents.filter(i => i.status === 'open' && _INVESTIGATION_PHASES.has(i.phase || '')).length;
+  const _cntClosed = d.incidents.filter(i => i.status === 'closed').length;
+  const _cntMine = _me ? d.incidents.filter(i => i.status !== 'closed' && (i.assigned_to || '') === _me).length : 0;
+
   h+=`<div id="myDashboardCard"></div>`;   // filled async by _loadMyDashboard
   h+=`<div class="cards" style="grid-template-columns:repeat(4,1fr);margin-bottom:12px;">
-    <div class="card"><h4>All Incidents</h4><div class="val">${d.incidents.length}</div></div>
+    <div class="card"><h4>Active Incidents</h4><div class="val">${_cntActive}</div><div style="font-size:10px;color:var(--text-dim);">of ${d.incidents.length} total (${_cntClosed} closed)</div></div>
     <div class="card"><h4>Active Blocks</h4><div class="val" style="color:var(--alert);">${cs?.blocklist||0}</div></div>
     <div class="card"><h4>Quarantined</h4><div class="val" style="color:var(--medium);">${cs?.quarantine||0}</div></div>
     <div class="card"><h4>Watchlist</h4><div class="val" style="color:var(--accent);">${cs?.watchlist||0}</div></div>
   </div>`;
   h+=`<div style="display:flex;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:8px;">
     <div class="sub-tabs" id="incStatusFilter">
-      <button class="sub-tab active" onclick="filterIncidents('')">All</button>
-      <button class="sub-tab" onclick="filterIncidents('open')">Open</button>
-      <button class="sub-tab" onclick="filterIncidents('investigating')">Investigating</button>
-      <button class="sub-tab" onclick="filterIncidents('closed')">Closed</button>
-      <button class="sub-tab" style="border-left:1px solid var(--border);margin-left:4px;padding-left:12px;" onclick="filterIncidents('mine')">My Incidents</button>
+      <button class="sub-tab active" onclick="filterIncidents('')">All <span class="rpt-count">(${_cntActive})</span></button>
+      <button class="sub-tab" onclick="filterIncidents('open')">Open <span class="rpt-count">(${_cntOpen})</span></button>
+      <button class="sub-tab" onclick="filterIncidents('investigating')">Investigating <span class="rpt-count">(${_cntInvestigating})</span></button>
+      <button class="sub-tab" onclick="filterIncidents('closed')">Closed <span class="rpt-count">(${_cntClosed})</span></button>
+      <button class="sub-tab" style="border-left:1px solid var(--border);margin-left:4px;padding-left:12px;" onclick="filterIncidents('mine')">My Incidents <span class="rpt-count">(${_cntMine})</span></button>
     </div>
     <div style="display:flex;gap:6px;">
       <button class="btn btn-sm" style="border-color:var(--medium);color:var(--medium);" onclick="bulkAutoResolve()">Smart Resolve Queue</button>
@@ -3604,14 +3612,17 @@ function incidentApplyPager(action,value){
 const _INVESTIGATION_PHASES = new Set(['investigate','contain','eradicate','recover']);
 
 function _incidentMatchesFilter(inc, filter){
-  if(!filter) return true;
+  // "All" (empty filter) means all ACTIVE work — closed incidents live only
+  // under the Closed tab so they don't drown out live queues.
+  if(!filter) return inc.status !== 'closed';
   if(filter==='mine'){
     const me=(currentUser&&currentUser.username)||'';
     if(!me) return false;
     return inc.status==='open' && (inc.assigned_to||'')===me;
   }
   if(filter==='investigating') return inc.status==='open' && _INVESTIGATION_PHASES.has(inc.phase||'');
-  if(filter==='open')   return inc.status==='open';
+  // Open = still in triage (open but no phase advance yet). Investigating is separate.
+  if(filter==='open')   return inc.status==='open' && (!inc.phase || inc.phase==='triage');
   if(filter==='closed') return inc.status==='closed';
   return inc.status===filter;
 }
