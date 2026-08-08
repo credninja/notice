@@ -418,13 +418,15 @@ function sevLabel(s){return{1:'Critical',2:'High',3:'Medium',critical:'Critical'
 // 30s TTL; cleared on time-range change.
 const _apiCache={};
 function _apiCacheClear(){Object.keys(_apiCache).forEach(k=>delete _apiCache[k]);}
+// AI endpoints need a longer timeout — local LLM calls can take 30-60s on CPU
+function _timeoutFor(url){ return url.includes('/api/ai/') || url.includes('/ai-analysis') || url.includes('/ai-draft') ? 180000 : 60000; }
 async function api(url){
   const now=Date.now();
   const cached=_apiCache[url];
   if(cached&&(now-cached.t)<60000) return cached.d;
   try{
     const ctrl=new AbortController();
-    const tmr=setTimeout(()=>ctrl.abort(),60000);
+    const tmr=setTimeout(()=>ctrl.abort(),_timeoutFor(url));
     const r=await fetch(url,{cache:'no-store',headers:{'Cache-Control':'no-cache'},signal:ctrl.signal});
     clearTimeout(tmr);
     const d=await r.json();
@@ -432,7 +434,15 @@ async function api(url){
     return d;
   }catch(e){console.error('API error:',url,e);return null;}
 }
-async function apiPost(url,data){const r=await fetch(url,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','Cache-Control':'no-cache','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify(data)});return r.json();}
+async function apiPost(url,data){
+  const ctrl=new AbortController();
+  const tmr=setTimeout(()=>ctrl.abort(),_timeoutFor(url));
+  try{
+    const r=await fetch(url,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','Cache-Control':'no-cache','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify(data),signal:ctrl.signal});
+    clearTimeout(tmr);
+    return r.json();
+  }catch(e){clearTimeout(tmr);console.error('API POST error:',url,e);return {error:'Request failed or timed out: '+e.message};}
+}
 async function apiPut(url,data){const r=await fetch(url,{method:'PUT',cache:'no-store',headers:{'Content-Type':'application/json','Cache-Control':'no-cache','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify(data)});return r.json();}
 async function apiDelete(url){const r=await fetch(url,{method:'DELETE',cache:'no-store',headers:{'Cache-Control':'no-cache','X-Requested-With':'XMLHttpRequest'}});return r.json();}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
