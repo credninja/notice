@@ -4018,6 +4018,18 @@ async function showIncidentDetail(id){
     }catch(e){console.error('Failed to load assignees:',e);}
   },0);
 
+  // AI triage assistant panel — analyst clicks button, local LLM writes a verdict recommendation
+  h+=`<div class="detail-panel" style="padding:10px;margin-bottom:10px;border-left:3px solid #8b5cf6;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <div>
+        <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;font-weight:700;">🧠 AI Triage Assistant</div>
+        <div style="font-size:10px;color:var(--text-dim);margin-top:2px;">Runs a local LLM on incident context — nothing leaves your server.</div>
+      </div>
+      <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiAnalyze(${d.id},this)">Analyze Incident</button>
+    </div>
+    <div id="aiAnalysisBody" style="margin-top:8px;"></div>
+  </div>`;
+
   // Related history panel — helps triage by showing prior verdicts for this signature
   h+=`<div id="incRelatedHistory" style="margin-bottom:10px;"></div>`;
   setTimeout(async()=>{
@@ -5041,6 +5053,44 @@ async function markIncidentInvestigating(id){
 }
 
 // Reopen a closed incident — status goes back to open, verdict cleared.
+// AI triage — POSTs to /api/incidents/<id>/ai-analysis, renders verdict inline
+async function _aiAnalyze(id, btn){
+  const body=document.getElementById('aiAnalysisBody');
+  if(!body) return;
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Thinking…';
+  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);padding:6px 0;">🤔 Local LLM is analyzing this incident — this can take 10–30 seconds…</div>';
+  try{
+    const r=await apiPost('/api/incidents/'+id+'/ai-analysis',{});
+    if(r && !r.error){
+      const vColors={likely_true_positive:'#dc2626',likely_false_positive:'#16a34a',investigate_further:'#f59e0b'};
+      const vLabels={likely_true_positive:'⚠ LIKELY TRUE POSITIVE',likely_false_positive:'✓ LIKELY FALSE POSITIVE',investigate_further:'🔍 INVESTIGATE FURTHER'};
+      const cColors={high:'var(--critical)',medium:'var(--medium)',low:'var(--text-dim)'};
+      const verdict=r.verdict||'investigate_further';
+      const conf=r.confidence||'low';
+      const indicators=(r.key_indicators||[]).map(k=>`<li style="font-size:11px;color:var(--text);margin:2px 0;">${esc(k)}</li>`).join('');
+      const ctx=r._context_summary||{};
+      const ctxLine=[];
+      if(ctx.prior_fp_pct !== null && ctx.prior_fp_pct !== undefined) ctxLine.push(`prior ${ctx.prior_fp_pct}% FP`);
+      if(ctx.source_external) ctxLine.push('external source');
+      if(ctx.total_events) ctxLine.push(`${ctx.total_events} events`);
+      body.innerHTML=`<div style="padding:8px 12px;border-radius:6px;background:${vColors[verdict]||'#666'}22;border-left:3px solid ${vColors[verdict]||'#666'};">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <strong style="color:${vColors[verdict]||'#666'};font-size:12px;">${vLabels[verdict]||verdict}</strong>
+          <span style="font-size:9px;color:${cColors[conf]||'#666'};text-transform:uppercase;letter-spacing:.5px;font-weight:700;">${conf} confidence</span>
+        </div>
+        <div style="font-size:11px;color:var(--text);line-height:1.5;margin-bottom:8px;">${esc(r.reasoning||'')}</div>
+        ${r.suggested_action?`<div style="font-size:11px;padding:6px 10px;background:var(--bg);border-radius:4px;margin-bottom:6px;"><strong>Suggested action:</strong> ${esc(r.suggested_action)}</div>`:''}
+        ${indicators?`<div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;font-weight:700;margin-bottom:2px;">Key evidence</div><ul style="margin:0;padding-left:18px;">${indicators}</ul>`:''}
+        <div style="font-size:9px;color:var(--text-dim);margin-top:8px;font-style:italic;">Model: ${esc(r._model||'?')}${ctxLine.length?' · '+ctxLine.join(' · '):''}</div>
+      </div>`;
+    } else {
+      body.innerHTML=`<div style="padding:8px;color:var(--critical);font-size:11px;">AI unavailable: ${esc(r?.error||'unknown')}</div>`;
+    }
+  } finally {
+    btn.disabled=false; btn.textContent=orig;
+  }
+}
+
 async function reopenIncident(id){
   if(!confirm('Reopen incident #'+id+'? Verdict and closure fields will be cleared.')) return;
   const r=await apiPost('/api/incidents/'+id+'/reopen',{});

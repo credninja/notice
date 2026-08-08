@@ -1586,6 +1586,31 @@ def register(app):
     # ------------------------------------------------------------------
     # Related history — for triage helper "closed N times, X TP, Y FP"
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # LLM triage assistant — runs a local Ollama model against incident
+    # context and returns a verdict recommendation + suggested action.
+    # ------------------------------------------------------------------
+    @app.post("/api/incidents/<incident_id:int>/ai-analysis")
+    def ai_analysis(incident_id):
+        try:
+            from analyzers.llm_assistant import analyze_incident
+        except Exception as e:
+            response.status = 500
+            return {"error": f"LLM module unavailable: {e}"}
+        result = analyze_incident(incident_id)
+        if "error" in result:
+            response.status = 503
+            return result
+        return result
+
+    @app.get("/api/ai/health")
+    def ai_health():
+        try:
+            from analyzers.llm_assistant import health
+        except Exception as e:
+            return {"ok": False, "error": f"LLM module unavailable: {e}"}
+        return health()
+
     @app.get("/api/incidents/<incident_id:int>/related-history")
     def related_history(incident_id):
         conn = get_db()
