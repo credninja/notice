@@ -1106,6 +1106,35 @@ def register(app):
 
         sev_colors_map = {"critical": "#DC2626", "high": "#EA580C", "medium": "#D97706", "low": "#16A34A", "info": "#2563EB"}
 
+        # ── AI executive summary (optional — only if Ollama is up) ──
+        ai_exec_html = ""
+        try:
+            from analyzers.llm_assistant import executive_summary
+            crit_titles = [inc.get("title", "")[:120] for inc in incidents
+                           if inc.get("verdict") == "true_positive" and inc.get("severity") in ("critical", "high")][:5]
+            stats = {
+                "date": date_str,
+                "total_closed": total,
+                "true_positives": tp,
+                "false_positives": fp,
+                "by_severity": sev_counts,
+                "top_classifications": [{"name": k, "count": v} for k, v in
+                                        sorted(class_counts.items(), key=lambda x: -x[1])[:5]],
+                "critical_incidents": crit_titles,
+            }
+            exec_r = executive_summary(stats)
+            if "error" not in exec_r:
+                ai_exec_html = f'''<div style="margin:10px 0 20px 0;padding:16px 20px;background:linear-gradient(135deg,#F5F3FF,#EEF2FF);border-left:4px solid #8B5CF6;border-radius:6px;">
+                    <div style="font-size:9px;text-transform:uppercase;letter-spacing:1.5px;color:#6D28D9;font-weight:700;margin-bottom:8px;">&#129504; AI Executive Brief</div>
+                    <div style="font-size:14px;font-weight:700;color:#1a1a2e;margin-bottom:8px;">{h_esc(exec_r.get("headline", ""))}</div>
+                    <div style="font-size:12px;color:#374151;line-height:1.6;margin-bottom:6px;"><strong>Operations:</strong> {h_esc(exec_r.get("operational_summary", ""))}</div>
+                    <div style="font-size:12px;color:#374151;line-height:1.6;margin-bottom:6px;"><strong>Notable:</strong> {h_esc(exec_r.get("notable_items", ""))}</div>
+                    <div style="font-size:12px;color:#374151;line-height:1.6;"><strong>Focus tomorrow:</strong> {h_esc(exec_r.get("recommended_focus", ""))}</div>
+                    <div style="font-size:9px;color:#9CA3AF;margin-top:8px;font-style:italic;">Model: {h_esc(exec_r.get("_model", "?"))}</div>
+                </div>'''
+        except Exception:
+            pass  # LLM optional; report still renders without it
+
         # Fetch evidence for all incidents in this batch
         evidence_conn = get_db()
         inc_ids = [inc["id"] for inc in incidents]
@@ -1381,6 +1410,7 @@ def register(app):
         <h2>Executive Summary</h2>
         <div class="sub">{date_display}</div>
       </div>
+      {ai_exec_html}
       <div class="chart-grid">
         <div class="chart-box">
           <h3>Verdict Distribution</h3>
@@ -1610,6 +1640,164 @@ def register(app):
         except Exception as e:
             return {"ok": False, "error": f"LLM module unavailable: {e}"}
         return health()
+
+    # ── AI: explain a Suricata rule (by SID) ──
+    @app.get("/api/ai/explain-rule")
+    def ai_explain_rule():
+        try:
+            from analyzers.llm_assistant import explain_rule
+        except Exception as e:
+            response.status = 503
+            return {"error": f"LLM unavailable: {e}"}
+        sid = request.query.get("sid", "").strip()
+        signature = request.query.get("signature", "").strip()
+        rule_text = ""
+        # Load the real rule text from the Suricata rule files (via the
+        # shared rules index) so the LLM has actual content to explain.
+        if sid and sid.isdigit():
+            try:
+                from analyzers.suricata_rules import get_rules_by_sids
+                rmap = get_rules_by_sids({int(sid)})
+                rule = rmap.get(int(sid))
+                if rule:
+                    rule_text = rule.get("raw_line") or ""
+                    if not signature:
+                        signature = rule.get("msg", "")
+            except Exception:
+                pass
+        result = explain_rule(
+            signature_id=int(sid) if sid.isdigit() else None,
+            signature=signature or None,
+            rule_text=rule_text or None,
+        )
+        if "error" in result:
+            response.status = 503
+        return result
+
+    # ── AI: generate a Suricata rule from plain English ──
+    @app.post("/api/ai/generate-rule")
+    def ai_generate_rule():
+        try:
+            from analyzers.llm_assistant import generate_rule
+        except Exception as e:
+            response.status = 503
+            return {"error": f"LLM unavailable: {e}"}
+        data = request.json or {}
+        desc = (data.get("description") or "").strip()
+        if not desc:
+            response.status = 400
+            return {"error": "description required"}
+        result = generate_rule(desc)
+        if "error" in result:
+            response.status = 503
+        return result
+
+    # ── AI: draft closure fields for an incident ──
+    @app.post("/api/incidents/<incident_id:int>/ai-draft-closure")
+    def ai_draft_closure(incident_id):
+        try:
+            from analyzers.llm_assistant import draft_closure
+        except Exception as e:
+            response.status = 503
+            return {"error": f"LLM unavailable: {e}"}
+        data = request.json or {}
+        verdict = (data.get("verdict") or "").strip() or None
+        result = draft_closure(incident_id, verdict=verdict)
+        if "error" in result:
+            response.status = 503
+        return result
+
+    # ── AI: rapid triage of a single alert ──
+    @app.post("/api/ai/analyze-alert")
+    def ai_analyze_alert():
+        try:
+            from analyzers.llm_assistant import analyze_alert
+        except Exception as e:
+            response.status = 503
+            return {"error": f"LLM unavailable: {e}"}
+        alert = request.json or {}
+        if not alert.get("signature") and not alert.get("signature_id"):
+            response.status = 400
+            return {"error": "signature or signature_id required"}
+        # Enrich with prior-verdict counts if not provided
+        if "prior_tp" not in alert or "prior_fp" not in alert:
+            sid = alert.get("signature_id")
+            if sid:
+                try:
+                    conn = get_db()
+                    rows = conn.execute(
+                        "SELECT verdict, COUNT(*) as c FROM incidents "
+                        "WHERE signature_id=? AND status='closed' GROUP BY verdict",
+                        (sid,),
+                    ).fetchall()
+                    counts = {r["verdict"]: r["c"] for r in rows}
+                    alert["prior_tp"] = counts.get("true_positive", 0)
+                    alert["prior_fp"] = counts.get("false_positive", 0)
+                    conn.close()
+                except Exception:
+                    alert["prior_tp"] = alert["prior_fp"] = 0
+        result = analyze_alert(alert)
+        if "error" in result:
+            response.status = 503
+        return result
+
+    # ── AI: natural-language search ──
+    @app.post("/api/ai/nl-search")
+    def ai_nl_search():
+        try:
+            from analyzers.llm_assistant import parse_nl_search
+        except Exception as e:
+            response.status = 503
+            return {"error": f"LLM unavailable: {e}"}
+        data = request.json or {}
+        query = (data.get("query") or "").strip()
+        if not query:
+            response.status = 400
+            return {"error": "query required"}
+        actor = ""
+        try:
+            actor = (getattr(request, "user", {}) or {}).get("username", "") or ""
+        except Exception:
+            pass
+        filters = parse_nl_search(query, current_user=actor)
+        if "error" in filters:
+            response.status = 503
+            return filters
+        # Now execute the filter against incidents
+        conn = get_db()
+        q = "SELECT * FROM incidents WHERE 1=1"
+        params = []
+        if filters.get("status"):
+            q += " AND status=?"
+            params.append(filters["status"])
+        if filters.get("severity"):
+            q += " AND severity=?"
+            params.append(filters["severity"])
+        if filters.get("verdict"):
+            q += " AND verdict=?"
+            params.append(filters["verdict"])
+        if filters.get("assigned_to"):
+            q += " AND assigned_to=?"
+            params.append(filters["assigned_to"])
+        if filters.get("q"):
+            like = f"%{filters['q']}%"
+            q += (" AND (title LIKE ? OR signature LIKE ? OR attacker_ip LIKE ? OR victim_ip LIKE ?)")
+            params.extend([like, like, like, like])
+        if filters.get("minutes"):
+            q += f" AND created_at > datetime('now', '-{int(filters['minutes'])} minutes', 'localtime')"
+        q += " ORDER BY created_at DESC LIMIT 200"
+        try:
+            rows = [dict(r) for r in conn.execute(q, params).fetchall()]
+        except Exception as e:
+            conn.close()
+            response.status = 500
+            return {"error": f"Query failed: {e}", "filters": filters}
+        conn.close()
+        return {
+            "filters": filters,
+            "count": len(rows),
+            "incidents": rows,
+        }
 
     @app.get("/api/incidents/<incident_id:int>/related-history")
     def related_history(incident_id):

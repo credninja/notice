@@ -2568,6 +2568,15 @@ function _secRenderDetail(d){
     <div><span class="rpt-dim">Severity (raw):</span> ${esc(String(sevText||'-'))}</div>
   </div>`;
   if(sigText) h+=`<div style="margin-bottom:10px;font-size:13px;font-weight:600;">${esc(sigText)}</div>`;
+  // AI triage panel for this alert group
+  h+=`<div style="margin-bottom:14px;padding:8px 12px;background:rgba(139,92,246,.06);border-left:3px solid #8b5cf6;border-radius:6px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+    <div>
+      <strong style="font-size:11px;color:#8b5cf6;">🧠 AI Alert Triage</strong>
+      <span style="font-size:10px;color:var(--text-dim);margin-left:6px;">Rapid verdict on this alert (local LLM)</span>
+    </div>
+    <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick='_aiAnalyzeAlert(${JSON.stringify({signature_id:d.sid,signature:sigText,src_ip:d.src,dest_ip:d.dst,category:"",severity:sevText||""}).replace(/'/g,"&apos;")}, this)'>Triage</button>
+  </div>
+  <div id="aiAlertTriageBody" style="margin-bottom:14px;"></div>`;
   // Firing rule — async-loaded so the modal opens fast and the rule body
   // arrives a moment later. Container is filled by _secLoadRule().
   h+=`<div id="secRuleBody" style="margin-bottom:14px;"><div style="font-size:11px;color:var(--text-dim);font-style:italic;">Looking up rule sid ${esc(String(d.sid))}…</div></div>`;
@@ -3323,9 +3332,12 @@ async function loadIncidents(){
     </div>
   </div>`;
   h+=`<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;">
-    <input type="text" id="incSearchBox" placeholder="🔍 Search incidents (title, IP, SID, signature, ID)…"
-      oninput="_incSearchOnInput(this.value)" value="${esc(window._incSearchQ||'')}"
+    <input type="text" id="incSearchBox" placeholder="🔍 Search: text OR ask in plain English (Ctrl+Enter for AI). e.g. 'critical open from external in last 24h'"
+      oninput="_incSearchOnInput(this.value)"
+      onkeydown="if(event.ctrlKey&&event.key==='Enter'){_aiNlSearch(this.value);}"
+      value="${esc(window._incSearchQ||'')}"
       style="flex:1;min-width:280px;padding:8px 12px;font-size:12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;">
+    <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiNlSearch(document.getElementById('incSearchBox').value)" title="Ask in plain English (Ctrl+Enter also works)">🧠 AI Search</button>
     <div id="incBulkBar" style="display:none;gap:6px;align-items:center;">
       <span id="incSelCount" style="font-size:11px;color:var(--accent);font-weight:700;">0 selected</span>
       <button class="btn btn-sm" onclick="_incBulkAction('mark_investigating')">Mark Investigating</button>
@@ -3393,6 +3405,27 @@ async function _loadMyDashboard(){
 
 // Debounced search
 let _incSearchTimer=null;
+// AI natural-language search — asks the LLM to translate query into filters
+async function _aiNlSearch(query){
+  query=(query||'').trim();
+  if(!query){showToast('Type a query first','warning');return;}
+  showToast('🧠 AI translating your query…','info',3000);
+  const r=await apiPost('/api/ai/nl-search',{query});
+  if(!r || r.error){showToast('AI search failed: '+(r?.error||'unknown'),'error');return;}
+  const f=r.filters||{};
+  const bits=[];
+  if(f.status) bits.push('status='+f.status);
+  if(f.severity) bits.push('sev='+f.severity);
+  if(f.verdict) bits.push('verdict='+f.verdict);
+  if(f.assigned_to) bits.push('assigned='+f.assigned_to);
+  if(f.q) bits.push('text="'+f.q+'"');
+  if(f.minutes) bits.push('last '+f.minutes+' min');
+  showToast(`AI interpreted: ${bits.join(', ')||'no filters'} → ${r.count} results`,'success',6000);
+  // Show the results directly (replace list)
+  window._incidents=r.incidents||[];
+  document.getElementById('incidentList').innerHTML=renderIncidentList(window._incidents);
+}
+
 function _incSearchOnInput(v){
   window._incSearchQ=v;
   clearTimeout(_incSearchTimer);
@@ -5216,12 +5249,50 @@ function showCloseIncidentModal(id, inc){
       <div style="font-size:10px;color:var(--text-dim);margin-top:4px;">Files are uploaded and hashed (SHA256) before the incident closes. Max 50 MB each.</div>
     </div>
 
-    <div class="actions" style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
-      <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
-      <button class="btn btn-primary" onclick="submitCloseIncident(${id},this)">Close Incident</button>
+    <div class="actions" style="margin-top:14px;display:flex;gap:8px;justify-content:space-between;flex-wrap:wrap;">
+      <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiDraftClosure(${id},this)" title="Let the local LLM draft closure fields based on evidence — you edit before closing">🧠 Draft closure fields</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
+        <button class="btn btn-primary" onclick="submitCloseIncident(${id},this)">Close Incident</button>
+      </div>
     </div>
   </div>`;
   document.body.appendChild(overlay);
+}
+
+// AI: draft closure summary/RCA/actions/lessons — analyst reviews + edits
+async function _aiDraftClosure(id, btn){
+  const orig=btn.textContent;
+  btn.disabled=true; btn.textContent='Drafting…';
+  const verdictEl=document.getElementById('closeVerdict');
+  const verdict=verdictEl?verdictEl.value:'';
+  const r=await apiPost('/api/incidents/'+id+'/ai-draft-closure',{verdict});
+  btn.disabled=false; btn.textContent=orig;
+  if(r&&!r.error){
+    // Populate the fields; only overwrite if they're empty (respect analyst's typed content)
+    const map={
+      closeSummary:r.summary,
+      closeRootCause:r.root_cause,
+      closeActions:r.actions_taken,
+      closeLessons:r.lessons_learned,
+    };
+    let overwriteAll=true;
+    // If any field has content, ask analyst
+    for(const [k,v] of Object.entries(map)){
+      const el=document.getElementById(k);
+      if(el && el.value && el.value.trim()){
+        overwriteAll=confirm('Some closure fields already have content. Overwrite with AI draft?');
+        break;
+      }
+    }
+    for(const [k,v] of Object.entries(map)){
+      const el=document.getElementById(k);
+      if(el && (overwriteAll || !el.value || !el.value.trim())) el.value=v||'';
+    }
+    showToast('AI draft loaded — review and edit before closing','success');
+  } else {
+    showToast('AI draft failed: '+(r?.error||'unknown'),'error');
+  }
 }
 
 // Upload any files selected in the Close modal's file input as evidence.
@@ -8496,6 +8567,7 @@ function _renderRuleManager(d){
   // Toolbar
   h+=`<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">
     <button class="btn btn-primary" onclick="_ruleMgrOpen()">+ Create Rule</button>
+    <button class="btn" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiRuleGenModal()" title="Describe a detection in plain English — LLM writes the Suricata rule">🧠 AI Generate Rule</button>
     <button class="btn" onclick="_ruleMgrApply()" title="Write all enabled rules to the rules file">Apply &amp; Reload</button>
     <button class="btn" onclick="_deployExt2IntPack()" title="Deploy the bundled External→Internal rule pack (~40 rules covering scan/brute force/exploit/C2/protocol abuse)">Deploy Ext→Int Pack</button>
     <button class="btn" onclick="_deployAssetIdPack()" title="Deploy the Asset-Identification pack: discovery, role drift, identity exposure, insider risk, service drift, BYOD/Shadow IT (~40 rules)">Deploy Asset-ID Pack</button>
@@ -9708,9 +9780,140 @@ async function _showRuleText(sid){
   if(!sid)return;
   const d=await api('/api/monitoring/rule-text/'+sid);
   if(!d||d.error){showToast('Rule SID '+sid+' not found in rule files','error');return;}
-  showConfirm('Rule SID '+sid+' — '+d.file,
-    '<pre style="font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto;background:var(--bg);padding:12px;border-radius:6px;border:1px solid var(--border);font-family:monospace;">'+esc(d.rule)+'</pre>',
-    null,{cancelText:'Close',hideConfirm:true});
+  const body='<pre style="font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto;background:var(--bg);padding:12px;border-radius:6px;border:1px solid var(--border);font-family:monospace;">'+esc(d.rule)+'</pre>'+
+    '<div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">'+
+      '<button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiExplainRule('+sid+',this)">🧠 Explain with AI</button>'+
+      '<span id="aiExplainStatus" style="font-size:10px;color:var(--text-dim);"></span>'+
+    '</div>'+
+    '<div id="aiExplainBody" style="margin-top:8px;"></div>';
+  showConfirm('Rule SID '+sid+' — '+d.file, body, null, {cancelText:'Close', hideConfirm:true});
+}
+
+// AI: rapid triage of a single alert (called from alert detail modal)
+async function _aiAnalyzeAlert(alert, btn){
+  const body=document.getElementById('aiAlertTriageBody');
+  if(!body) return;
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Thinking…';
+  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);padding:6px 0;">🤔 Analyzing…</div>';
+  try{
+    const r=await apiPost('/api/ai/analyze-alert',alert);
+    if(r && !r.error){
+      const vColors={likely_true_positive:'#dc2626',likely_false_positive:'#16a34a',promote_to_incident:'#8b5cf6'};
+      const vLabels={likely_true_positive:'⚠ Likely TRUE POSITIVE',likely_false_positive:'✓ Likely FALSE POSITIVE',promote_to_incident:'⚑ PROMOTE to incident'};
+      const cColors={high:'var(--critical)',medium:'var(--medium)',low:'var(--text-dim)'};
+      body.innerHTML=`<div style="padding:8px 12px;border-radius:6px;background:${vColors[r.verdict]||'#666'}22;border-left:3px solid ${vColors[r.verdict]||'#666'};">
+        <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+          <strong style="color:${vColors[r.verdict]||'#666'};font-size:12px;">${vLabels[r.verdict]||r.verdict}</strong>
+          <span style="font-size:9px;color:${cColors[r.confidence]||'#666'};text-transform:uppercase;letter-spacing:.5px;font-weight:700;">${r.confidence||'low'} confidence</span>
+        </div>
+        <div style="font-size:11px;color:var(--text);line-height:1.5;margin-bottom:6px;">${esc(r.reasoning||'')}</div>
+        ${r.suggested_action?`<div style="font-size:11px;padding:4px 8px;background:var(--bg);border-radius:4px;"><strong>Action:</strong> ${esc(r.suggested_action)}</div>`:''}
+        <div style="font-size:9px;color:var(--text-dim);margin-top:6px;font-style:italic;">Model: ${esc(r._model||'?')}</div>
+      </div>`;
+    } else {
+      body.innerHTML=`<div style="padding:8px;color:var(--critical);font-size:11px;">AI unavailable: ${esc(r?.error||'unknown')}</div>`;
+    }
+  } finally {
+    btn.disabled=false; btn.textContent=orig;
+  }
+}
+
+// AI: generate a Suricata rule from a plain-English description
+function _aiRuleGenModal(){
+  const overlay=document.createElement('div');
+  overlay.className='modal-overlay';
+  overlay.onclick=e=>{if(e.target===overlay)overlay.remove();};
+  overlay.innerHTML=`<div class="modal" style="max-width:720px;max-height:90vh;overflow-y:auto;">
+    <h2 style="margin:0 0 4px;">🧠 AI Rule Generator</h2>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;">Describe the detection you want in plain English. The local LLM will produce a Suricata rule you can review and deploy.</div>
+    <textarea id="aiRuleGenDesc" rows="4" placeholder="e.g. Alert when any external IP tries to connect to internal FTP servers on port 21 more than 5 times in 60 seconds" style="width:100%;font-size:12px;padding:8px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;"></textarea>
+    <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
+      <button class="btn btn-primary" onclick="_aiRuleGenGo(this)">Generate Rule</button>
+      <span id="aiRuleGenStatus" style="font-size:10px;color:var(--text-dim);"></span>
+    </div>
+    <div id="aiRuleGenResult" style="margin-top:12px;"></div>
+    <div class="actions" style="margin-top:14px;display:flex;justify-content:flex-end;">
+      <button class="btn" onclick="this.closest('.modal-overlay').remove()">Close</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  setTimeout(()=>document.getElementById('aiRuleGenDesc').focus(),100);
+}
+
+async function _aiRuleGenGo(btn){
+  const descEl=document.getElementById('aiRuleGenDesc');
+  const status=document.getElementById('aiRuleGenStatus');
+  const result=document.getElementById('aiRuleGenResult');
+  const description=(descEl.value||'').trim();
+  if(!description){showToast('Enter a description','warning');return;}
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Generating…';
+  status.textContent='(15-45s on CPU)';
+  result.innerHTML='';
+  try{
+    const r=await apiPost('/api/ai/generate-rule',{description});
+    if(r && !r.error){
+      const rule=r.rule||'';
+      result.innerHTML=`<div style="padding:12px 14px;background:var(--bg);border-left:3px solid #8b5cf6;border-radius:6px;">
+        <div style="font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-dim);font-weight:700;margin-bottom:6px;">Generated Suricata rule</div>
+        <pre style="font-family:monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;padding:10px;background:#1e293b;color:#e2e8f0;border-radius:4px;margin:0 0 8px 0;">${esc(rule)}</pre>
+        <div style="font-size:11px;color:var(--text);margin-bottom:6px;"><strong>What it catches:</strong> ${esc(r.explanation||'')}</div>
+        <div style="font-size:11px;color:var(--text);margin-bottom:8px;"><strong>Caveats:</strong> ${esc(r.caveats||'')}</div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-sm" onclick="navigator.clipboard.writeText(\`${rule.replace(/\`/g,'\\\`').replace(/\$/g,'\\$')}\`);showToast('Rule copied','success');">Copy Rule</button>
+          <button class="btn btn-sm btn-primary" onclick="_aiRuleGenAcceptToEditor(\`${rule.replace(/\`/g,'\\\`').replace(/\$/g,'\\$')}\`)">Open in Editor</button>
+        </div>
+        <div style="font-size:9px;color:var(--text-dim);margin-top:8px;font-style:italic;">Model: ${esc(r._model||'?')} · Change the sid=9999999 before deploying to avoid collision.</div>
+      </div>`;
+    } else {
+      result.innerHTML=`<div style="padding:8px;color:var(--critical);font-size:11px;">AI unavailable: ${esc(r?.error||'unknown')}</div>`;
+    }
+  } finally {
+    btn.disabled=false; btn.textContent=orig;
+    status.textContent='';
+  }
+}
+
+function _aiRuleGenAcceptToEditor(rule){
+  // Close the generator modal, open the create-rule modal, prefill
+  document.querySelectorAll('.modal-overlay').forEach(o=>o.remove());
+  if(typeof _ruleMgrOpen==='function'){
+    _ruleMgrOpen();
+    setTimeout(()=>{
+      const ta=document.querySelector('#ruleMgrModalContent textarea, textarea[name="raw_line"], #ruleRawText');
+      if(ta) ta.value=rule;
+      else showToast('Rule generated — paste manually into the Rule Text field','info');
+    },200);
+  } else {
+    showToast('Rule Manager unavailable; copy the rule manually','warning');
+  }
+}
+
+// AI: explain a Suricata rule
+async function _aiExplainRule(sid, btn){
+  const body=document.getElementById('aiExplainBody');
+  const status=document.getElementById('aiExplainStatus');
+  if(!body) return;
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Thinking…';
+  if(status) status.textContent='(this can take 15-45s on CPU)';
+  body.innerHTML='';
+  try{
+    const r=await api('/api/ai/explain-rule?sid='+sid);
+    if(r && !r.error){
+      body.innerHTML=`<div style="padding:10px 14px;background:rgba(139,92,246,.08);border-left:3px solid #8b5cf6;border-radius:6px;font-size:11px;line-height:1.6;">
+        <div style="margin-bottom:6px;"><strong>Purpose:</strong> ${esc(r.purpose||'')}</div>
+        <div style="margin-bottom:6px;"><strong>How it detects:</strong> ${esc(r.detection_logic||'')}</div>
+        <div style="margin-bottom:6px;"><strong>Typical true positive:</strong> ${esc(r.common_true_positive||'')}</div>
+        <div style="margin-bottom:6px;"><strong>Typical false positive:</strong> ${esc(r.common_false_positive||'')}</div>
+        <div style="margin-bottom:2px;"><strong>Tuning advice:</strong> ${esc(r.tuning_advice||'')}</div>
+        <div style="font-size:9px;color:var(--text-dim);margin-top:8px;font-style:italic;">Model: ${esc(r._model||'?')}</div>
+      </div>`;
+    } else {
+      body.innerHTML=`<div style="padding:8px;color:var(--critical);font-size:11px;">AI unavailable: ${esc(r?.error||'unknown')}</div>`;
+    }
+  } finally {
+    btn.disabled=false; btn.textContent=orig;
+    if(status) status.textContent='';
+  }
 }
 
 async function regenerateAssetRules(){

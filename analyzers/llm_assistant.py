@@ -207,21 +207,25 @@ def _build_user_prompt(ctx):
     return "\n".join(lines)
 
 
-def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT):
-    """POST to Ollama /api/chat with a JSON format request."""
+def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT,
+                 json_mode=True, num_predict=400, temperature=0.2):
+    """POST to Ollama /api/chat. If json_mode=True, forces + parses JSON.
+    If json_mode=False, returns {"text": <plain text>}.
+    """
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "format": "json",     # force JSON output
         "stream": False,
         "options": {
-            "temperature": 0.2,   # low, we want factual & consistent
-            "num_predict": 400,
+            "temperature": temperature,
+            "num_predict": num_predict,
         },
     }
+    if json_mode:
+        payload["format"] = "json"
     req = urllib.request.Request(
         OLLAMA_HOST + "/api/chat",
         data=json.dumps(payload).encode(),
@@ -239,10 +243,243 @@ def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT):
     content = ((body.get("message") or {}).get("content") or "").strip()
     if not content:
         return {"error": "Empty response from LLM"}
+    if not json_mode:
+        return {"text": content}
     try:
         return json.loads(content)
     except json.JSONDecodeError:
         return {"error": "LLM returned non-JSON output", "raw": content[:500]}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Additional LLM helpers for various NOTICE workflows
+# Each returns a dict; on failure {"error": "..."}; on success typed data.
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── 1. Suricata rule explanation ─────────────────────────────────────
+_RULE_EXPLAIN_SYSTEM = """You explain Suricata IDS rules to SOC analysts.
+Given a rule (or its signature name if the raw text isn't available), respond in JSON:
+{
+  "purpose": "one-sentence plain-English purpose of the rule",
+  "detection_logic": "1-3 sentences on WHAT patterns/conditions trigger it",
+  "common_true_positive": "typical malicious scenario that would fire it",
+  "common_false_positive": "typical benign scenario that could fire it",
+  "tuning_advice": "how to reduce FPs if noisy (one sentence)"
+}
+Be concise and technical. If the rule reference is missing details, use signature name for context."""
+
+
+def explain_rule(signature_id=None, signature=None, rule_text=None):
+    """Explain a Suricata rule. Provide any combination of sid/signature/raw rule text."""
+    if not (signature_id or signature or rule_text):
+        return {"error": "Provide signature_id, signature name, or rule_text"}
+    parts = []
+    if signature_id:
+        parts.append(f"Signature ID: {signature_id}")
+    if signature:
+        parts.append(f"Signature name: {signature}")
+    if rule_text:
+        parts.append(f"Rule source:\n{rule_text[:2000]}")
+    prompt = "\n".join(parts) + "\n\nExplain this rule as JSON per the schema."
+    result = _call_ollama(prompt, system_prompt=_RULE_EXPLAIN_SYSTEM, num_predict=350)
+    if "error" not in result:
+        result["_model"] = OLLAMA_MODEL
+    return result
+
+
+# ── 2. Suricata rule generator (plain English -> rule) ───────────────
+_RULE_GENERATE_SYSTEM = """You generate Suricata IDS rules from plain-English detection intent.
+Given an analyst's description, produce a syntactically valid Suricata rule.
+Respond in JSON:
+{
+  "rule": "the full alert rule as a single line, using sid:9999999; rev:1; (analyst edits SID before deploying)",
+  "explanation": "one-sentence explanation of what this rule will catch",
+  "caveats": "1-2 sentences on likely FP sources or when this may over-fire"
+}
+Guidelines:
+- Use standard Suricata syntax and variables: $HOME_NET, $EXTERNAL_NET, $HTTP_SERVERS
+- Prefer thresholds when the intent implies frequency (threshold:type both, track by_src, count N, seconds M;)
+- Set classtype appropriately (attempted-recon, attempted-admin, trojan-activity, etc.)
+- Always include msg, classtype, sid (use 9999999 as placeholder), rev
+- If the intent is ambiguous, pick the most common interpretation and note it in caveats"""
+
+
+def generate_rule(description):
+    """Generate a Suricata rule from a plain-English description."""
+    if not description or not description.strip():
+        return {"error": "Description is required"}
+    prompt = f"Detection intent: {description.strip()}\n\nProduce the Suricata rule as JSON per the schema."
+    result = _call_ollama(prompt, system_prompt=_RULE_GENERATE_SYSTEM, num_predict=400)
+    if "error" not in result:
+        result["_model"] = OLLAMA_MODEL
+    return result
+
+
+# ── 3. Daily report executive summary ─────────────────────────────────
+_EXEC_SUMMARY_SYSTEM = """You are a senior SOC lead writing a daily brief for management.
+Given the day's incident statistics, produce a 3-paragraph executive summary
+in JSON:
+{
+  "headline": "one-sentence bottom line for the CISO",
+  "operational_summary": "2-3 sentences: what activity happened today",
+  "notable_items": "1-2 sentences: any TP incidents needing follow-up, or notable patterns",
+  "recommended_focus": "one sentence: what SOC should prioritize tomorrow"
+}
+Write for a non-technical exec. Avoid jargon. Only cite numbers from the input; do not invent."""
+
+
+def executive_summary(stats):
+    """Generate exec summary for a daily report.
+    stats dict expected keys: date, total_closed, true_positives, false_positives,
+    by_severity, top_classifications (list of {name, count}), top_sources (list),
+    critical_incidents (list of titles).
+    """
+    lines = [f"Date: {stats.get('date', '')}"]
+    lines.append(f"Total incidents closed: {stats.get('total_closed', 0)}")
+    lines.append(f"  True positives: {stats.get('true_positives', 0)}")
+    lines.append(f"  False positives: {stats.get('false_positives', 0)}")
+    if stats.get("by_severity"):
+        sev_line = ", ".join(f"{k}={v}" for k, v in stats["by_severity"].items() if v)
+        lines.append(f"Severity breakdown: {sev_line}")
+    if stats.get("top_classifications"):
+        lines.append("Top classifications:")
+        for c in stats["top_classifications"][:5]:
+            lines.append(f"  - {c.get('name', '')}: {c.get('count', 0)}")
+    if stats.get("critical_incidents"):
+        lines.append("Notable true-positive incidents:")
+        for t in stats["critical_incidents"][:5]:
+            lines.append(f"  - {t}")
+    prompt = "\n".join(lines) + "\n\nWrite the exec brief as JSON per the schema."
+    result = _call_ollama(prompt, system_prompt=_EXEC_SUMMARY_SYSTEM, num_predict=500)
+    if "error" not in result:
+        result["_model"] = OLLAMA_MODEL
+    return result
+
+
+# ── 4. Auto-drafted closure summary + RCA ─────────────────────────────
+_CLOSURE_DRAFT_SYSTEM = """You draft incident closure notes for SOC analysts to review and refine.
+Given incident context (metadata, IOCs, events, verdict), produce a draft closure per this JSON:
+{
+  "summary": "2-3 sentence closure summary — what happened, what was decided",
+  "root_cause": "1-2 sentence root cause analysis",
+  "actions_taken": "1-2 sentences on containment/eradication steps that were (or should have been) taken",
+  "lessons_learned": "1 sentence on what to improve"
+}
+Assume the analyst will edit. Draft the most likely narrative given the evidence.
+- If verdict is 'false_positive', frame around why the alert was benign (misconfiguration, legitimate scanner, expected traffic).
+- If verdict is 'true_positive', frame around what the attacker did and how it was stopped.
+- If verdict is missing, produce a neutral draft covering the observed activity."""
+
+
+def draft_closure(incident_id, verdict=None):
+    """Draft closure fields for an incident."""
+    ctx = _fetch_incident_context(incident_id)
+    if ctx is None:
+        return {"error": "Incident not found"}
+    # If verdict wasn't passed, try to read it from context (won't be there for open incidents)
+    lines = [f"Incident: {ctx['title']}"]
+    lines.append(f"Signature: {ctx['signature']} (SID {ctx['signature_id']})")
+    lines.append(f"Severity: {ctx['severity']}")
+    lines.append(f"Verdict decision: {verdict or '(analyst has not chosen yet — draft neutrally)'}")
+    lines.append(f"Source: {ctx['source_ip']} ({'external' if ctx['source_is_external'] else 'internal'})")
+    if ctx["source_asset"]:
+        a = ctx["source_asset"]
+        lines.append(f"  Source asset: owner={a.get('owner', '?')}, type={a.get('asset_type', '?')}")
+    lines.append(f"Destination: {ctx['destination_ip']} ({'external' if ctx['destination_is_external'] else 'internal'})")
+    if ctx["destination_asset"]:
+        a = ctx["destination_asset"]
+        lines.append(f"  Dest asset: owner={a.get('owner', '?')}, type={a.get('asset_type', '?')}, critical={bool(a.get('business_critical'))}")
+    h = ctx["prior_verdicts_for_sid"]
+    if h["total"] > 0:
+        lines.append(f"Prior verdicts for this SID: {h['tp']} TP / {h['fp']} FP")
+    lines.append(f"Event volume: {ctx['total_events']}")
+    if ctx["sample_events"]:
+        lines.append("Sample events:")
+        for ev in ctx["sample_events"][:3]:
+            lines.append(f"  - {ev.get('event_summary', '')[:100]}")
+    prompt = "\n".join(lines) + "\n\nDraft the closure fields as JSON per the schema."
+    result = _call_ollama(prompt, system_prompt=_CLOSURE_DRAFT_SYSTEM, num_predict=500)
+    if "error" not in result:
+        result["_model"] = OLLAMA_MODEL
+    return result
+
+
+# ── 5. Alert-level triage (lighter than incident triage) ──────────────
+_ALERT_TRIAGE_SYSTEM = """You are a SOC analyst rapid-triaging a single alert (not yet an incident).
+Given an alert with its signature, source, destination, and prior verdicts for the same SID,
+respond in JSON:
+{
+  "verdict": "likely_true_positive" | "likely_false_positive" | "promote_to_incident",
+  "confidence": "low" | "medium" | "high",
+  "reasoning": "1-2 sentences",
+  "suggested_action": "one concrete verb — 'dismiss', 'monitor', 'promote', 'investigate source', etc."
+}
+Bias toward "likely_false_positive" if the prior FP rate is >80%.
+Bias toward "promote_to_incident" if the signature name contains attack keywords
+(brute, exploit, injection, backdoor, c2, reverse_shell) and the source is external."""
+
+
+def analyze_alert(alert_dict):
+    """Rapid triage of a single alert.
+    alert_dict expected: {signature_id, signature, src_ip, dest_ip, dest_port,
+    severity, category, prior_tp, prior_fp}
+    """
+    if not alert_dict:
+        return {"error": "Alert dict required"}
+    lines = []
+    lines.append(f"Signature: {alert_dict.get('signature', '')} (SID {alert_dict.get('signature_id', '?')})")
+    lines.append(f"Source: {alert_dict.get('src_ip', '?')} -> Destination: {alert_dict.get('dest_ip', '?')}:{alert_dict.get('dest_port', '?')}")
+    lines.append(f"Category: {alert_dict.get('category', '?')} · Severity: {alert_dict.get('severity', '?')}")
+    src = alert_dict.get("src_ip", "")
+    is_ext = not (src.startswith("10.") or src.startswith("172.16.") or src.startswith("192.168.")) if src else False
+    lines.append(f"Source is {'EXTERNAL' if is_ext else 'INTERNAL'}")
+    tp = alert_dict.get("prior_tp", 0)
+    fp = alert_dict.get("prior_fp", 0)
+    if tp + fp > 0:
+        lines.append(f"Prior verdicts for this SID: {tp} TP / {fp} FP ({round(fp/(tp+fp)*100)}% FP)")
+    else:
+        lines.append("Prior verdicts for this SID: none (never seen closed)")
+    prompt = "\n".join(lines) + "\n\nTriage the alert as JSON per the schema."
+    result = _call_ollama(prompt, system_prompt=_ALERT_TRIAGE_SYSTEM, num_predict=300)
+    if "error" not in result:
+        result["_model"] = OLLAMA_MODEL
+    return result
+
+
+# ── 6. Natural-language search (NL -> filter dict) ────────────────────
+_NL_SEARCH_SYSTEM = """You translate an analyst's natural-language query into a JSON filter for
+NOTICE's incident search. Respond ONLY with valid JSON per this schema:
+{
+  "status": "open" | "closed" | null,
+  "severity": "critical" | "high" | "medium" | "low" | null,
+  "verdict": "true_positive" | "false_positive" | null,
+  "assigned_to": "<username>" | null,
+  "q": "<free-text substring to search title/signature/IPs>" | null,
+  "minutes": <int minutes lookback> | null,
+  "explanation": "one sentence explaining what filter you built"
+}
+Rules:
+- If the query mentions "external", "attackers", "internet", set q to include broader match, do not restrict IP
+- "last 24 hours" -> minutes: 1440. "last week" -> minutes: 10080. "today" -> minutes: 1440.
+- "assigned to me" -> assigned_to: "__me__" (server will substitute the caller)
+- If the query mentions a specific IP/CIDR, put it in q
+- Any unmentioned field must be null (not empty string)
+- Keep q short and specific — a substring, not a full sentence"""
+
+
+def parse_nl_search(query, current_user=None):
+    """Translate a natural-language query into a filter dict."""
+    if not query or not query.strip():
+        return {"error": "Query required"}
+    prompt = f"Analyst query: {query.strip()}\n\nProduce the filter as JSON per the schema."
+    result = _call_ollama(prompt, system_prompt=_NL_SEARCH_SYSTEM, num_predict=250)
+    if "error" in result:
+        return result
+    # Substitute __me__ with actual username
+    if current_user and result.get("assigned_to") == "__me__":
+        result["assigned_to"] = current_user
+    result["_model"] = OLLAMA_MODEL
+    return result
 
 
 def analyze_incident(incident_id):
