@@ -9910,11 +9910,8 @@ async function _aiExplainRule(sid, btn){
     const r=await api('/api/ai/explain-rule?sid='+sid);
     if(r && !r.error){
       body.innerHTML=`<div style="padding:10px 14px;background:rgba(139,92,246,.08);border-left:3px solid #8b5cf6;border-radius:6px;font-size:11px;line-height:1.6;">
-        <div style="margin-bottom:6px;"><strong>Purpose:</strong> ${esc(r.purpose||'')}</div>
-        <div style="margin-bottom:6px;"><strong>How it detects:</strong> ${esc(r.detection_logic||'')}</div>
-        <div style="margin-bottom:6px;"><strong>Typical true positive:</strong> ${esc(r.common_true_positive||'')}</div>
-        <div style="margin-bottom:6px;"><strong>Typical false positive:</strong> ${esc(r.common_false_positive||'')}</div>
-        <div style="margin-bottom:2px;"><strong>Tuning advice:</strong> ${esc(r.tuning_advice||'')}</div>
+        <div style="margin-bottom:8px;"><strong>Purpose:</strong> ${esc(r.purpose||'')}</div>
+        <div><strong>What the rule says:</strong> ${esc(r.detection_logic||'')}</div>
         <div style="font-size:9px;color:var(--text-dim);margin-top:8px;font-style:italic;">Model: ${esc(r._model||'?')}</div>
       </div>`;
     } else {

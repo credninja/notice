@@ -257,33 +257,15 @@ def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT,
 # ═══════════════════════════════════════════════════════════════════════
 
 # ── 1. Suricata rule explanation ─────────────────────────────────────
-_RULE_EXPLAIN_SYSTEM = """You explain Suricata IDS rules to SOC analysts.
-Given a rule (or its signature name if the raw text isn't available), respond in JSON:
+_RULE_EXPLAIN_SYSTEM = """You explain Suricata IDS rules to SOC analysts in plain English.
+Given a rule (or its signature name if the raw text isn't available), respond in JSON with just two fields:
 {
-  "purpose": "one-sentence plain-English purpose of the rule",
-  "detection_logic": "1-3 sentences on WHAT patterns/conditions trigger it",
-  "common_true_positive": "typical malicious scenario that would fire it",
-  "common_false_positive": "typical benign scenario that could fire it",
-  "tuning_advice": "concrete guidance on how to reduce FPs if noisy (one sentence)"
+  "purpose": "one-sentence plain-English purpose — what this rule is meant to catch and why",
+  "detection_logic": "1-3 sentences explaining what the rule is actually saying — decode the source/destination, ports, thresholds (count N in M seconds), flow direction, and any content matches into plain English"
 }
 
-CRITICAL — how Suricata thresholds work (get this right, users will apply your advice):
-- 'threshold:type both, track by_src, count N, seconds M;' means: fire an alert only when
-  the same source triggers the rule N or more times within an M-second window.
-- To REDUCE false positives on a noisy threshold rule:
-  * INCREASE count (requires MORE events before firing — less sensitive)
-  * DECREASE seconds (shorter window means events must be MORE concentrated — less sensitive)
-  * Add source/destination exclusions (e.g. '!$HOME_NET', '![10.1.96.53]') to skip legit sources
-  * Narrow the port list or add missing ports to a baseline exclusion (![port1,port2,...])
-  * Add flow:established or content: filters to require more specific traffic
-- To INCREASE sensitivity (find MORE alerts): DECREASE count or INCREASE seconds.
-- NEVER suggest "reduce count and increase seconds" — that combination makes the rule fire MORE, not less.
-
-For rules with a baseline exclusion like ![5601,22,53]:
-- If FPs come from a specific legitimate port, ADD that port to the exclusion list.
-- If FPs come from a specific legitimate source, add a source exclusion (![10.1.96.53] any -> ...).
-
-Be concise and technical. If the rule reference is missing details, use signature name for context."""
+Be concise and factual. Only describe what the rule literally does — do NOT invent TP/FP scenarios
+or tuning advice. If the rule text isn't provided, base your explanation on the signature name."""
 
 
 def explain_rule(signature_id=None, signature=None, rule_text=None):
