@@ -23,7 +23,8 @@ Complete step-by-step guide to deploy the NOTICE security monitoring platform fr
 11. [Operational Procedures](#11-operational-procedures)
 12. [Troubleshooting](#12-troubleshooting)
 13. [Security Hardening](#13-security-hardening)
-14. [Optional: External Enrichment (VT / AbuseIPDB / GeoIP)](#14-optional-external-enrichment)
+14. [Optional: LLM Triage Assistant (Local Ollama)](#14-optional-llm-triage-assistant-local-ollama)
+15. [Optional: External Enrichment (VT / AbuseIPDB / GeoIP)](#15-optional-external-enrichment)
 
 ---
 
@@ -1203,7 +1204,110 @@ Add NOTICE and Suricata log paths to your existing SIEM / log aggregator if you 
 
 ---
 
-## 14. Optional: External Enrichment
+## 14. Optional: LLM Triage Assistant (Local Ollama)
+
+NOTICE ships with a local-LLM triage helper. Analysts click "🧠 Analyze Incident" on any incident detail and get an AI verdict recommendation (likely TP / FP / investigate further) with reasoning and a suggested next action.
+
+Everything runs on the NOTICE server — no cloud API calls, no per-query cost, no data leaves your infrastructure.
+
+### Requirements
+
+- **RAM:** 4 GB free (for llama3.2:3b) — check with `free -h`
+- **Disk:** ~2 GB for the model
+- **CPU:** works on CPU-only (~10–20 sec per analysis); GPU speeds it up dramatically
+
+### 14.1 Install Ollama
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sudo sh
+```
+
+If the install script leaves out the systemd unit (older Ubuntu versions), create it manually:
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin -m -d /usr/share/ollama ollama
+sudo bash -c 'cat > /etc/systemd/system/ollama.service' <<'UNIT'
+[Unit]
+Description=Ollama Service
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ollama serve
+User=ollama
+Group=ollama
+Restart=on-failure
+RestartSec=3
+Environment=OLLAMA_HOST=127.0.0.1:11434
+Environment=OLLAMA_MODELS=/usr/share/ollama/.ollama/models
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo mkdir -p /usr/share/ollama/.ollama/models
+sudo chown -R ollama:ollama /usr/share/ollama
+sudo systemctl daemon-reload
+sudo systemctl enable --now ollama
+```
+
+Verify:
+```bash
+systemctl is-active ollama
+curl -s http://127.0.0.1:11434/api/tags   # should return {"models":[]}
+```
+
+### 14.2 Pull a model
+
+Start with the small, fast model:
+```bash
+ollama pull llama3.2:3b        # ~2 GB, ~10 sec/response on CPU
+```
+
+If you have more RAM and want better quality:
+```bash
+ollama pull llama3.1:8b        # ~5 GB, ~30 sec/response on CPU
+```
+
+### 14.3 Configure NOTICE to use it
+
+Add to `.env`:
+```
+OLLAMA_HOST=http://127.0.0.1:11434
+OLLAMA_MODEL=llama3.2:3b
+OLLAMA_TIMEOUT=60
+```
+
+Restart NOTICE:
+```bash
+sudo systemctl restart notice
+```
+
+### 14.4 Test
+
+Log into NOTICE, open any incident, click **🧠 Analyze Incident**. Within 10–30 seconds you should see a coloured verdict block with the AI's recommendation.
+
+### 14.5 Health check
+
+```bash
+curl -sk https://localhost:8080/api/ai/health
+```
+
+Expected: `{"ok": true, "host": "http://127.0.0.1:11434", "installed_models": ["llama3.2:3b"], "configured_model": "llama3.2:3b", "model_present": true}`
+
+If `model_present: false`, run `ollama pull <MODEL>` to fetch it.
+
+### 14.6 Upgrading the model
+
+Any Ollama-compatible model works. For example:
+- `mistral:7b` — Mistral 7B (~4 GB, better reasoning)
+- `qwen2.5:7b` — Qwen 2.5 (~5 GB, strong on technical text)
+- `gemma3:12b` — Google Gemma 3 (~9 GB, best quality if you have RAM)
+
+To switch: `ollama pull <model>` then set `OLLAMA_MODEL` in `.env` and restart NOTICE.
+
+---
+
+## 15. Optional: External Enrichment
 
 ### 14.1 VirusTotal (free tier: 500 lookups/day)
 
