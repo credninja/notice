@@ -264,8 +264,25 @@ Given a rule (or its signature name if the raw text isn't available), respond in
   "detection_logic": "1-3 sentences on WHAT patterns/conditions trigger it",
   "common_true_positive": "typical malicious scenario that would fire it",
   "common_false_positive": "typical benign scenario that could fire it",
-  "tuning_advice": "how to reduce FPs if noisy (one sentence)"
+  "tuning_advice": "concrete guidance on how to reduce FPs if noisy (one sentence)"
 }
+
+CRITICAL — how Suricata thresholds work (get this right, users will apply your advice):
+- 'threshold:type both, track by_src, count N, seconds M;' means: fire an alert only when
+  the same source triggers the rule N or more times within an M-second window.
+- To REDUCE false positives on a noisy threshold rule:
+  * INCREASE count (requires MORE events before firing — less sensitive)
+  * DECREASE seconds (shorter window means events must be MORE concentrated — less sensitive)
+  * Add source/destination exclusions (e.g. '!$HOME_NET', '![10.1.96.53]') to skip legit sources
+  * Narrow the port list or add missing ports to a baseline exclusion (![port1,port2,...])
+  * Add flow:established or content: filters to require more specific traffic
+- To INCREASE sensitivity (find MORE alerts): DECREASE count or INCREASE seconds.
+- NEVER suggest "reduce count and increase seconds" — that combination makes the rule fire MORE, not less.
+
+For rules with a baseline exclusion like ![5601,22,53]:
+- If FPs come from a specific legitimate port, ADD that port to the exclusion list.
+- If FPs come from a specific legitimate source, add a source exclusion (![10.1.96.53] any -> ...).
+
 Be concise and technical. If the rule reference is missing details, use signature name for context."""
 
 
