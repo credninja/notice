@@ -5283,14 +5283,13 @@ async function _aiRunAssetAnalyze(ip, btn){
       return;
     }
     const type=clsErr?'—':(cls.asset_type||'unknown');
-    const role=clsErr?'—':(cls.specific_role||'unknown');
     const confidence=clsErr?'low':(cls.confidence||'low');
     const reasoning=clsErr?'':cls.reasoning||'';
     const normal=profErr?'':prof.normal_behavior||'';
     const changes=profErr?'':prof.recent_changes||'';
     const watch=profErr?'':prof.watch_for||'';
     body.innerHTML=`<div style="padding:10px 14px;background:rgba(16,185,129,.08);border-left:3px solid #10b981;border-radius:6px;font-size:11px;margin-bottom:10px;">
-        <div style="margin-bottom:4px;"><strong>Type:</strong> ${esc(type)} · <strong>Role:</strong> ${esc(role)}</div>
+        <div style="margin-bottom:4px;"><strong>Type:</strong> ${esc(type)}</div>
         <div style="margin-bottom:4px;font-size:10px;color:var(--text-dim);">Confidence: ${esc(confidence)}</div>
         ${reasoning?`<div><strong>Reasoning:</strong> ${esc(reasoning)}</div>`:''}
       </div>
