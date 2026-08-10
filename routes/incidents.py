@@ -1803,7 +1803,7 @@ def register(app):
     # SESSION 1 AI endpoints — enrichment narrators
     # ═══════════════════════════════════════════════════════════════
 
-    # ── Dashboard: morning briefing ──
+    # ── Dashboard: situation report (last 24h, timezone-safe) ──
     @app.get("/api/ai/dashboard-briefing")
     def ai_dash_briefing():
         try:
@@ -1811,51 +1811,49 @@ def register(app):
         except Exception as e:
             response.status = 503; return {"error": f"LLM unavailable: {e}"}
         conn = get_db()
-        # Today
-        today = conn.execute("SELECT date('now','localtime') as d").fetchone()["d"]
-        yest = conn.execute("SELECT date('now','-1 day','localtime') as d").fetchone()["d"]
-        def _stat(day, verdict=None, status=None):
-            q = "SELECT COUNT(*) as c FROM incidents WHERE date(created_at)=?"
-            p = [day]
-            if verdict:
-                q += " AND verdict=?"; p.append(verdict)
-            if status:
-                q += " AND status=?"; p.append(status)
-            return conn.execute(q, p).fetchone()["c"]
+        # Use time-based windows instead of date() to avoid timezone issues.
+        # ingested_alerts.timestamp is ISO 8601 with timezone offset — string
+        # compare against a bounded ISO string is reliable and fast (indexed).
         try:
-            today_alerts = conn.execute(
-                "SELECT COUNT(*) as c FROM ingested_alerts WHERE date(timestamp)=?", (today,)
-            ).fetchone()["c"]
-            yest_alerts = conn.execute(
-                "SELECT COUNT(*) as c FROM ingested_alerts WHERE date(timestamp)=?", (yest,)
+            alerts_24h = conn.execute(
+                "SELECT COUNT(*) as c FROM ingested_alerts "
+                "WHERE timestamp >= datetime('now', '-1 day', 'localtime')"
             ).fetchone()["c"]
         except Exception:
-            today_alerts = yest_alerts = 0
-        # Gather all _stat calls BEFORE closing conn
-        today_open = _stat(today, status="open")
-        today_tp = _stat(today, verdict="true_positive", status="closed")
-        today_fp = _stat(today, verdict="false_positive", status="closed")
-        yest_tp = _stat(yest, verdict="true_positive", status="closed")
-        yest_fp = _stat(yest, verdict="false_positive", status="closed")
+            alerts_24h = 0
+        open_total = conn.execute(
+            "SELECT COUNT(*) as c FROM incidents WHERE status='open'"
+        ).fetchone()["c"]
+        closed_tp_24h = conn.execute(
+            "SELECT COUNT(*) as c FROM incidents "
+            "WHERE status='closed' AND verdict='true_positive' "
+            "AND resolved_at > datetime('now', '-1 day', 'localtime')"
+        ).fetchone()["c"]
+        closed_fp_24h = conn.execute(
+            "SELECT COUNT(*) as c FROM incidents "
+            "WHERE status='closed' AND verdict='false_positive' "
+            "AND resolved_at > datetime('now', '-1 day', 'localtime')"
+        ).fetchone()["c"]
         top_open = [dict(r) for r in conn.execute(
             "SELECT title, severity FROM incidents WHERE status='open' "
             "ORDER BY CASE severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 "
             "WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END, created_at DESC LIMIT 5"
         ).fetchall()]
-        top_sigs = [{"name": r["signature"], "count": r["c"]} for r in conn.execute(
-            "SELECT signature, COUNT(*) as c FROM ingested_alerts "
-            "WHERE date(timestamp)=? GROUP BY signature ORDER BY c DESC LIMIT 5",
-            (today,)
-        ).fetchall()]
+        try:
+            top_sigs = [{"name": r["signature"], "count": r["c"]} for r in conn.execute(
+                "SELECT signature, COUNT(*) as c FROM ingested_alerts "
+                "WHERE timestamp >= datetime('now', '-1 day', 'localtime') "
+                "AND signature IS NOT NULL AND signature != '' "
+                "GROUP BY signature ORDER BY c DESC LIMIT 5"
+            ).fetchall()]
+        except Exception:
+            top_sigs = []
         conn.close()
         stats = {
-            "today_alerts": today_alerts,
-            "today_incidents_open": today_open,
-            "today_incidents_closed_tp": today_tp,
-            "today_incidents_closed_fp": today_fp,
-            "yesterday_alerts": yest_alerts,
-            "yesterday_incidents_closed_tp": yest_tp,
-            "yesterday_incidents_closed_fp": yest_fp,
+            "alerts_last_24h": alerts_24h,
+            "open_incidents_total": open_total,
+            "incidents_closed_tp_24h": closed_tp_24h,
+            "incidents_closed_fp_24h": closed_fp_24h,
             "top_open_incidents": top_open,
             "top_signatures": top_sigs,
         }
@@ -2060,28 +2058,45 @@ def register(app):
         return r
 
     # ── Assets: profile + auto-classify ──
+    # Note: ingested_alerts only contains alert events, not full flow data.
+    # For richer asset profiling we also pull from flow-level tables via
+    # iter_events, but for speed we use the alert index as a proxy.
     @app.get("/api/ai/profile-asset/<ip>")
     def ai_profile_asset(ip):
         try:
             from analyzers.llm_assistant import profile_asset
         except Exception as e:
             response.status = 503; return {"error": f"LLM unavailable: {e}"}
-        conn = get_db()
-        asset = conn.execute("SELECT * FROM assets WHERE ip=?", (ip,)).fetchone()
-        top_dest_ports = [(r["p"], r["c"]) for r in conn.execute(
-            "SELECT dest_port as p, COUNT(*) as c FROM ingested_alerts "
-            "WHERE src_ip=? AND dest_port IS NOT NULL GROUP BY dest_port ORDER BY c DESC LIMIT 8",
-            (ip,)
-        ).fetchall()]
-        top_peers = [(r["d"], r["c"]) for r in conn.execute(
-            "SELECT dest_ip as d, COUNT(*) as c FROM ingested_alerts "
-            "WHERE src_ip=? GROUP BY dest_ip ORDER BY c DESC LIMIT 5",
-            (ip,)
-        ).fetchall()]
-        total_flows = conn.execute(
-            "SELECT COUNT(*) as c FROM ingested_alerts WHERE src_ip=? OR dest_ip=?", (ip, ip)
-        ).fetchone()["c"]
-        conn.close()
+        try:
+            conn = get_db()
+            asset = conn.execute("SELECT * FROM assets WHERE ip=?", (ip,)).fetchone()
+            top_dest_ports = [(r["p"], r["c"]) for r in conn.execute(
+                "SELECT dest_port as p, COUNT(*) as c FROM ingested_alerts "
+                "WHERE src_ip=? AND dest_port IS NOT NULL AND dest_port > 0 "
+                "GROUP BY dest_port ORDER BY c DESC LIMIT 8",
+                (ip,)
+            ).fetchall()]
+            top_peers = [(r["d"], r["c"]) for r in conn.execute(
+                "SELECT dest_ip as d, COUNT(*) as c FROM ingested_alerts "
+                "WHERE src_ip=? AND dest_ip IS NOT NULL AND dest_ip != '' "
+                "GROUP BY dest_ip ORDER BY c DESC LIMIT 5",
+                (ip,)
+            ).fetchall()]
+            total_flows = conn.execute(
+                "SELECT COUNT(*) as c FROM ingested_alerts WHERE src_ip=? OR dest_ip=?", (ip, ip)
+            ).fetchone()["c"]
+            conn.close()
+        except Exception as e:
+            response.status = 500
+            return {"error": f"DB query failed: {e}"}
+        if total_flows == 0 and not asset:
+            return {
+                "role_summary": "unknown — no data",
+                "normal_behavior": f"No alert traffic observed for {ip} in the alert index and the IP is not a registered asset. There is nothing to profile.",
+                "recent_changes": "no data available",
+                "watch_for": "First step: register this IP in the Assets page if it's real, then wait for traffic to accumulate.",
+                "_note": "no_data",
+            }
         ctx = {
             "asset_info": dict(asset) if asset else {},
             "top_dest_ports": top_dest_ports,
@@ -2098,23 +2113,36 @@ def register(app):
             from analyzers.llm_assistant import auto_classify_asset
         except Exception as e:
             response.status = 503; return {"error": f"LLM unavailable: {e}"}
-        conn = get_db()
-        top_dest_ports = [(r["p"], r["c"]) for r in conn.execute(
-            "SELECT dest_port as p, COUNT(*) as c FROM ingested_alerts "
-            "WHERE src_ip=? AND dest_port IS NOT NULL GROUP BY dest_port ORDER BY c DESC LIMIT 10",
-            (ip,)
-        ).fetchall()]
-        # Listening ports = ports where THIS IP is dest and it's TCP
-        listening = [r["p"] for r in conn.execute(
-            "SELECT DISTINCT dest_port as p FROM ingested_alerts "
-            "WHERE dest_ip=? AND dest_port IS NOT NULL AND proto='TCP' "
-            "GROUP BY dest_port ORDER BY COUNT(*) DESC LIMIT 8",
-            (ip,)
-        ).fetchall()]
-        total = conn.execute(
-            "SELECT COUNT(*) as c FROM ingested_alerts WHERE src_ip=? OR dest_ip=?", (ip, ip)
-        ).fetchone()["c"]
-        conn.close()
+        try:
+            conn = get_db()
+            top_dest_ports = [(r["p"], r["c"]) for r in conn.execute(
+                "SELECT dest_port as p, COUNT(*) as c FROM ingested_alerts "
+                "WHERE src_ip=? AND dest_port IS NOT NULL AND dest_port > 0 "
+                "GROUP BY dest_port ORDER BY c DESC LIMIT 10",
+                (ip,)
+            ).fetchall()]
+            # Listening ports = ports where THIS IP is dest (any proto)
+            listening = [r["p"] for r in conn.execute(
+                "SELECT dest_port as p FROM ingested_alerts "
+                "WHERE dest_ip=? AND dest_port IS NOT NULL AND dest_port > 0 "
+                "GROUP BY dest_port ORDER BY COUNT(*) DESC LIMIT 8",
+                (ip,)
+            ).fetchall()]
+            total = conn.execute(
+                "SELECT COUNT(*) as c FROM ingested_alerts WHERE src_ip=? OR dest_ip=?", (ip, ip)
+            ).fetchone()["c"]
+            conn.close()
+        except Exception as e:
+            response.status = 500
+            return {"error": f"DB query failed: {e}"}
+        if total == 0:
+            return {
+                "asset_type": "unknown",
+                "specific_role": "unknown — no observed traffic",
+                "confidence": "low",
+                "reasoning": f"No traffic has been observed for {ip} in the alert index — cannot classify.",
+                "_note": "no_data",
+            }
         ctx = {
             "listening_ports": listening,
             "top_dest_ports": top_dest_ports,

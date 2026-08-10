@@ -529,58 +529,67 @@ def health():
 # All follow the same pattern: gather context → prompt LLM → return dict
 # ═══════════════════════════════════════════════════════════════════════
 
-# ── Dashboard briefing (morning brief + state-of-security) ──
-_DASH_BRIEFING_SYSTEM = """You are a senior SOC lead producing a morning brief for analysts starting their shift.
-Given yesterday's + today's activity, respond in JSON:
+# ── Dashboard situation report (formerly "morning briefing") ──
+_DASH_BRIEFING_SYSTEM = """You are a SOC lead writing a short factual situation report for another analyst.
+Given security activity numbers for the last 24 hours, respond in JSON:
 {
-  "headline": "one-line bottom line for the analyst starting their shift",
-  "yesterday": "1-2 sentences on what happened yesterday",
-  "today_so_far": "1-2 sentences on today's activity so far",
-  "focus_areas": ["short bullet 1", "short bullet 2", "short bullet 3"]
+  "headline": "one-sentence bottom line — what's the current situation",
+  "recent_activity": "2-3 sentences describing what happened in the last 24 hours (cite the actual numbers you were given)",
+  "current_status": "one sentence on where things stand right now",
+  "top_priorities": ["short priority 1", "short priority 2", "short priority 3"]
 }
-Be factual. Only cite numbers from the input. Keep it short — this is scanned in seconds."""
+
+Hard rules:
+- Only cite numbers YOU WERE GIVEN in the input. If a number is 0, that's a real observation — don't extrapolate.
+- If no top open incidents were listed, say "no notable open incidents" — DO NOT invent incident titles.
+- If no signatures were listed, say "no signature patterns to highlight" — DO NOT invent signature names.
+- Never claim "no alerts today" unless the input actually shows alerts_last_24h=0.
+- Keep it factual and terse. This is scanned in seconds, not read carefully."""
 
 
 def dashboard_briefing(stats):
-    """stats: {today_alerts, today_incidents_open, today_incidents_closed_tp,
-    today_incidents_closed_fp, yesterday_alerts, yesterday_incidents_closed_tp,
-    yesterday_incidents_closed_fp, top_open_incidents:[{title,severity}], top_signatures:[{name,count}]}"""
+    """stats: {alerts_last_24h, open_incidents_total, incidents_closed_tp_24h,
+    incidents_closed_fp_24h, top_open_incidents:[{title,severity}], top_signatures:[{name,count}]}"""
     if not stats:
         return {"error": "stats required"}
     lines = []
-    lines.append(f"TODAY: {stats.get('today_alerts', 0)} alerts, "
-                 f"{stats.get('today_incidents_open', 0)} open incidents, "
-                 f"{stats.get('today_incidents_closed_tp', 0)} closed TP, "
-                 f"{stats.get('today_incidents_closed_fp', 0)} closed FP")
-    lines.append(f"YESTERDAY: {stats.get('yesterday_alerts', 0)} alerts, "
-                 f"{stats.get('yesterday_incidents_closed_tp', 0)} closed TP, "
-                 f"{stats.get('yesterday_incidents_closed_fp', 0)} closed FP")
+    lines.append(f"Alerts fired in last 24 hours: {stats.get('alerts_last_24h', 0)}")
+    lines.append(f"Currently open incidents (all time): {stats.get('open_incidents_total', 0)}")
+    lines.append(f"Incidents closed in last 24 hours: "
+                 f"{stats.get('incidents_closed_tp_24h', 0)} true-positive, "
+                 f"{stats.get('incidents_closed_fp_24h', 0)} false-positive")
     if stats.get("top_open_incidents"):
-        lines.append("Top open incidents:")
+        lines.append("Top open incidents right now (by severity):")
         for i in stats["top_open_incidents"][:5]:
             lines.append(f"  - [{i.get('severity', '?')}] {i.get('title', '')[:100]}")
+    else:
+        lines.append("Top open incidents right now: none")
     if stats.get("top_signatures"):
-        lines.append("Top signatures today:")
+        lines.append("Top signatures firing in last 24 hours:")
         for s in stats["top_signatures"][:5]:
-            lines.append(f"  - {s.get('name', '')[:80]} ({s.get('count', 0)})")
-    prompt = "\n".join(lines) + "\n\nWrite the morning brief as JSON per the schema."
-    r = _call_ollama(prompt, system_prompt=_DASH_BRIEFING_SYSTEM, num_predict=350)
+            lines.append(f"  - {s.get('name', '')[:80]} ({s.get('count', 0)} times)")
+    else:
+        lines.append("Top signatures firing: none in the window")
+    prompt = "\n".join(lines) + "\n\nWrite the situation report as JSON per the schema."
+    r = _call_ollama(prompt, system_prompt=_DASH_BRIEFING_SYSTEM, num_predict=400)
     if "error" not in r:
         r["_model"] = OLLAMA_MODEL
     return r
 
 
-_STATE_OF_SEC_SYSTEM = """You produce a one-paragraph plain-English 'state of security' for a SOC dashboard.
+_STATE_OF_SEC_SYSTEM = """You write a plain-English security health check for a non-technical manager.
 Given aggregate stats, respond in JSON:
 {
-  "assessment": "traffic_light — 'green' | 'yellow' | 'red'",
-  "summary": "1-2 sentence health check for a manager",
-  "reasoning": "one sentence citing the specific numbers that drove your assessment"
+  "assessment": "green | yellow | red",
+  "summary": "1-2 sentences a non-technical manager can understand. Avoid jargon: no 'alert volume', 'FP suppression', 'traffic light'. Say things like 'things look normal', 'a few issues to keep an eye on', 'active problems that need attention'.",
+  "reasoning": "one plain sentence citing the actual numbers — e.g. 'We have 15 open cases and 2 needed real response in the last day.'"
 }
-Traffic light rules:
-  green  = alert volume normal, no TP incidents, no critical open incidents
-  yellow = alert volume elevated OR 1-2 TPs OR high-severity backlog
-  red    = major TP incidents active, or attack indicators present, or FP suppression not keeping up"""
+Assessment rules:
+  green  = everything normal, no confirmed real incidents recently, small open backlog
+  yellow = elevated activity OR 1-2 confirmed real incidents OR high-severity backlog
+  red    = confirmed real incidents happening now OR attack in progress OR unmanageable backlog
+
+Word "assessment" should be EXACTLY one of: green, yellow, red. Do not add prefixes like "traffic_light —"."""
 
 
 def state_of_security(stats):
@@ -599,14 +608,18 @@ def state_of_security(stats):
     return r
 
 
-_ANOMALY_SYSTEM = """You explain why current SOC metrics are unusual compared to baseline.
-Given current + baseline numbers, respond in JSON:
+_ANOMALY_SYSTEM = """You explain in plain English whether the network is behaving normally right now.
+Given current numbers and a baseline of what's typical, respond in JSON:
 {
   "is_anomalous": true | false,
-  "explanation": "2-3 sentences on what's unusual and the most likely cause",
-  "suggested_action": "one sentence — investigate, monitor, or dismiss"
+  "explanation": "2-3 sentences in plain English — no jargon like 'metric', 'baseline', 'standard deviation'. Say things like 'alerts are 3x higher than usual', 'this is normal for a weekday afternoon'.",
+  "suggested_action": "one sentence — should the analyst investigate, keep watching, or ignore"
 }
-Only mark is_anomalous=true if a metric is >2x its baseline or >3 standard deviations off."""
+
+Rules:
+- Mark is_anomalous=true only if a value is roughly 2x its typical rate or higher.
+- If either current or baseline is 0, be careful — don't call it anomalous based on math alone.
+- If the ratio symbol shows "infx" or "infinite", that means the baseline was 0 — in that case just say "we don't have enough history to compare" instead of calling it anomalous."""
 
 
 def anomaly_narrator(current_metrics, baseline_metrics):
@@ -674,15 +687,20 @@ def profile_ip(ip, ctx):
 
 
 # ── Asset profile summary / behavior change / auto-classify ──
-_ASSET_PROFILE_SYSTEM = """You describe a network asset's normal behavior for a SOC analyst.
-Given the asset's activity data, respond in JSON:
+_ASSET_PROFILE_SYSTEM = """You describe an asset's observed network behavior for a SOC analyst.
+Given the data provided (and ONLY that data), respond in JSON:
 {
-  "role_summary": "one-line role guess (e.g., 'internal DNS + AD server', 'analyst workstation', 'IP camera')",
-  "normal_behavior": "2-3 sentences on typical daily patterns — services, peers, volume",
-  "recent_changes": "one sentence — has behavior shifted recently? If nothing changed, say 'behavior consistent'",
-  "watch_for": "one sentence — what would be anomalous for this specific asset"
+  "role_summary": "one short line describing observed role — use generic terms: 'endpoint', 'server', 'infrastructure device', 'external service'. Do NOT invent a specific role like 'analyst workstation', 'IP camera', 'developer laptop'. If registered asset_type is given, use that. Otherwise say 'endpoint' or 'server' based on whether it acts more as a client (heavy outbound) or server (has listening ports).",
+  "normal_behavior": "2-3 sentences describing what patterns YOU CAN SEE in the data — top ports, top peers, traffic volume. Do NOT mention OS (Windows/Linux/Mac) unless the data explicitly says so.",
+  "recent_changes": "one sentence. If no change-signals were provided, say 'no change signals available'. Do NOT invent changes.",
+  "watch_for": "one sentence on what would look unusual given the observed pattern — cite specific ports/behaviors from the data, not generic advice"
 }
-Be specific to THIS asset's actual data. Don't give generic advice."""
+
+CRITICAL constraints:
+- Do NOT guess the operating system unless the input explicitly says Windows/Linux/Mac.
+- Do NOT invent user names, department names, or specific roles.
+- Do NOT say 'analyst workstation' — use 'endpoint' if it's a client-like device.
+- Only cite ports, peers, and services that appear in the input."""
 
 
 def profile_asset(ip, ctx):
@@ -709,14 +727,22 @@ def profile_asset(ip, ctx):
     return r
 
 
-_ASSET_CLASSIFY_SYSTEM = """Given an asset's traffic pattern, guess what kind of device it is.
+_ASSET_CLASSIFY_SYSTEM = """Classify an asset based ONLY on observed traffic evidence. No guessing.
 Respond in JSON:
 {
-  "asset_type": "workstation | server | iot | network_device | scanner | mobile | unknown",
-  "specific_role": "more specific guess (e.g., 'linux dev workstation', 'wazuh manager', 'IP camera', 'network printer')",
+  "asset_type": "endpoint | server | infrastructure | scanner | unknown",
+  "specific_role": "brief role based on evidence (e.g., 'web server' if listening on 80/443, 'DNS resolver' if handling port 53, 'management server' if MeshCentral/GLPI ports). Say 'unknown' if the data isn't clear.",
   "confidence": "low | medium | high",
-  "reasoning": "1-2 sentences citing which traffic characteristics led to this classification"
-}"""
+  "reasoning": "1-2 sentences citing the specific ports/patterns YOU SAW that led to this classification"
+}
+
+CRITICAL constraints:
+- Do NOT guess the operating system (Windows/Linux/Mac) unless it's in the input.
+- Do NOT invent a role — if listening_ports is empty and outbound traffic is generic web browsing (80/443), just say 'endpoint' with 'client-side browsing' as the role.
+- Confidence 'high' requires 2+ strong signals (e.g., listening on 443 AND HTTP User-Agent seen = web server).
+- 'infrastructure' = DNS resolvers, DHCP servers, gateway/router-like behavior.
+- 'scanner' = ONLY if traffic pattern shows connections to many distinct destinations on the same port(s).
+- If in doubt, say 'unknown' with low confidence — better than a wrong guess."""
 
 
 def auto_classify_asset(ip, ctx):

@@ -1066,28 +1066,28 @@ async function loadDashboard(){
 
   let h='';
 
-  // AI Dashboard row (Morning briefing + State-of-security + Anomaly narrator)
+  // AI Dashboard row (Situation Report + Security Health + Anomaly Radar)
   h+=`<div id="aiDashRow" style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px;margin-bottom:12px;">
     <div class="detail-panel" style="padding:12px;border-left:3px solid #8b5cf6;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-        <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;font-weight:700;">🧠 Morning Briefing</div>
+        <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;font-weight:700;">🧠 Situation Report</div>
         <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiDashBriefing(this)">Generate</button>
       </div>
-      <div id="aiDashBriefingBody" style="font-size:11px;color:var(--text-dim);font-style:italic;">Click Generate for today's SOC brief.</div>
+      <div id="aiDashBriefingBody" style="font-size:11px;color:var(--text-dim);font-style:italic;">Summary of the last 24 hours — click Generate.</div>
     </div>
     <div class="detail-panel" style="padding:12px;border-left:3px solid #10b981;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
         <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;font-weight:700;">🧠 Security Health</div>
         <button class="btn btn-sm" style="background:#10b981;color:#fff;border:none;" onclick="_aiStateOfSec(this)">Check</button>
       </div>
-      <div id="aiStateOfSecBody" style="font-size:11px;color:var(--text-dim);font-style:italic;">Click Check for state-of-security.</div>
+      <div id="aiStateOfSecBody" style="font-size:11px;color:var(--text-dim);font-style:italic;">One-line health check for management.</div>
     </div>
     <div class="detail-panel" style="padding:12px;border-left:3px solid #f59e0b;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
         <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;font-weight:700;">🧠 Anomaly Radar</div>
         <button class="btn btn-sm" style="background:#f59e0b;color:#fff;border:none;" onclick="_aiAnomalyNarrator(this)">Scan</button>
       </div>
-      <div id="aiAnomalyBody" style="font-size:11px;color:var(--text-dim);font-style:italic;">Click Scan to check for anomalies.</div>
+      <div id="aiAnomalyBody" style="font-size:11px;color:var(--text-dim);font-style:italic;">Is anything unusual right now?</div>
     </div>
   </div>`;
 
@@ -10029,15 +10029,15 @@ async function _showRuleText(sid){
 async function _aiDashBriefing(btn){
   const body=document.getElementById('aiDashBriefingBody');
   btn.disabled=true; const orig=btn.textContent; btn.textContent='Thinking…';
-  body.innerHTML='<span style="color:var(--text-dim);">Generating briefing (15-40s)…</span>';
+  body.innerHTML='<span style="color:var(--text-dim);">Generating situation report (15-40s)…</span>';
   try{
     const r=await api('/api/ai/dashboard-briefing');
     if(r && !r.error){
-      const focus=(r.focus_areas||[]).map(f=>`<li style="font-size:11px;margin:2px 0;">${esc(f)}</li>`).join('');
+      const priorities=(r.top_priorities||[]).map(f=>`<li style="font-size:11px;margin:2px 0;">${esc(f)}</li>`).join('');
       body.innerHTML=`<div style="font-size:12px;font-weight:700;color:var(--text);margin-bottom:6px;">${esc(r.headline||'')}</div>
-        <div style="font-size:11px;color:var(--text);margin-bottom:4px;"><strong>Yesterday:</strong> ${esc(r.yesterday||'')}</div>
-        <div style="font-size:11px;color:var(--text);margin-bottom:6px;"><strong>Today:</strong> ${esc(r.today_so_far||'')}</div>
-        ${focus?`<div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;font-weight:700;margin-bottom:2px;">Focus areas</div><ul style="margin:0;padding-left:16px;">${focus}</ul>`:''}
+        ${r.recent_activity?`<div style="font-size:11px;color:var(--text);margin-bottom:4px;"><strong>Last 24 hours:</strong> ${esc(r.recent_activity)}</div>`:''}
+        ${r.current_status?`<div style="font-size:11px;color:var(--text);margin-bottom:6px;"><strong>Right now:</strong> ${esc(r.current_status)}</div>`:''}
+        ${priorities?`<div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;font-weight:700;margin-bottom:2px;">Top priorities</div><ul style="margin:0;padding-left:16px;">${priorities}</ul>`:''}
         <div style="font-size:9px;color:var(--text-dim);margin-top:6px;font-style:italic;">Model: ${esc(r._model||'?')}</div>`;
     } else {
       body.innerHTML=`<span style="color:var(--critical);">AI unavailable: ${esc(r?.error||'unknown')}</span>`;
@@ -10052,10 +10052,17 @@ async function _aiStateOfSec(btn){
     const r=await api('/api/ai/state-of-security');
     if(r && !r.error){
       const lightColors={green:'#10b981',yellow:'#f59e0b',red:'#dc2626'};
-      const c=lightColors[r.assessment]||'#666';
+      // Normalise assessment — strip anything like "traffic_light — " prefix and lowercase
+      const rawAssessment=String(r.assessment||'').toLowerCase();
+      let assessment='unknown';
+      if(rawAssessment.includes('green')) assessment='green';
+      else if(rawAssessment.includes('yellow')) assessment='yellow';
+      else if(rawAssessment.includes('red')) assessment='red';
+      const c=lightColors[assessment]||'#666';
+      const labels={green:'ALL CLEAR',yellow:'KEEP AN EYE ON',red:'NEEDS ATTENTION'};
       body.innerHTML=`<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
         <span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:${c};"></span>
-        <strong style="color:${c};text-transform:uppercase;font-size:11px;">${esc(r.assessment||'?')}</strong>
+        <strong style="color:${c};text-transform:uppercase;font-size:11px;letter-spacing:.5px;">${labels[assessment]||assessment}</strong>
       </div>
       <div style="font-size:11px;color:var(--text);margin-bottom:4px;">${esc(r.summary||'')}</div>
       <div style="font-size:10px;color:var(--text-dim);font-style:italic;">${esc(r.reasoning||'')}</div>`;
