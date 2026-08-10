@@ -928,6 +928,7 @@ async function loadAssets_inner(ct){
     </div>
     <input type="text" id="assetMgFilter" placeholder="Filter by IP, owner, hostname, dept..." value="${esc(window._assetMgFilter||'')}"
       oninput="_setAssetMgFilter(this.value)" style="flex:1;min-width:200px;">
+    <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="aiMissingAssets()" title="LLM scans IPs seen in alerts that aren't registered assets and suggests which to onboard">🧠 Missing Assets</button>
     <button class="btn btn-primary" onclick="showAssetModal({scope:'${scope==='external'?'external':'internal'}'})">+ Add Asset</button>
   </div>`;
   if(!visible.length){
@@ -2436,7 +2437,11 @@ function renderSecGroups(groups){
       <td style="font-size:10px;">${esc(portsLabel)}</td>
       <td style="font-size:10px;color:var(--text-dim);">${fmtTime(g.first_seen)}</td>
       <td style="font-size:10px;color:var(--text-dim);">${fmtTime(g.last_seen)}</td>
-      <td><button class="btn btn-sm" onclick="event.stopPropagation();_secOpenDetail(${g.signature_id||0},'${esc(g.src_ip)}','${esc(g.dest_ip)}')">Inspect</button></td>
+      <td style="white-space:nowrap;">
+        <button class="btn btn-sm" onclick="event.stopPropagation();_secOpenDetail(${g.signature_id||0},'${esc(g.src_ip)}','${esc(g.dest_ip)}')">Inspect</button>
+        ${g.signature_id?`<button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;font-size:10px;padding:2px 6px;" onclick="event.stopPropagation();aiClusterStory(${g.signature_id})" title="LLM narrates what this cluster likely represents">🧠 Story</button>
+        <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;font-size:10px;padding:2px 6px;" onclick="event.stopPropagation();aiBulkTriage(${g.signature_id})" title="LLM suggests whether to bulk-close TP/FP or review individually">🧠 Bulk</button>`:''}
+      </td>
     </tr>`;
   });
   h+='</tbody></table></div>';
@@ -3194,6 +3199,10 @@ async function loadAnomalies(){
       </tr>
       <tr class="anom-reasoning" style="display:none"><td colspan="10" style="background:var(--bg);padding:10px 14px;font-size:11px;line-height:1.6;">
         <strong style="color:var(--accent)">Why this is anomalous:</strong> ${esc(a.reasoning||'No reasoning available.')}
+        <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">
+          <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="event.stopPropagation();aiAnomalyWhy('${esc(a.anomaly_type||'')}','${esc(a.src_ip||'')}','${esc((a.reasoning||'').replace(/'/g,'\\\'')).slice(0,300)}','${esc((a.dest_ip||'')+' :'+(a.port||''))}')">🧠 Why?</button>
+          <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="event.stopPropagation();aiAnomalyAction('${esc(a.anomaly_type||'')}','${esc(a.src_ip||'')}','${esc((a.reasoning||'').replace(/'/g,'\\\'')).slice(0,300)}')">🧠 Investigate or Dismiss?</button>
+        </div>
       </td></tr>`;
     });
     h+='</table></div></div>';
@@ -4125,6 +4134,7 @@ async function showIncidentDetail(id){
         <button class="btn btn-sm" style="background:#6366f1;color:#fff;border:none;" onclick="_aiSimilarInc(${d.id},this)">Similar History</button>
         <button class="btn btn-sm" style="background:#10b981;color:#fff;border:none;" onclick="_aiPlaybook(${d.id},this)">Playbook</button>
         <button class="btn btn-sm" style="background:#f59e0b;color:#fff;border:none;" onclick="_aiChain(${d.id},this)">Attack Chain</button>
+        <button class="btn btn-sm" style="background:#ec4899;color:#fff;border:none;" onclick="aiAutoPromoteReasoning(${d.id})" title="Why was this alert promoted to an incident?">Why Promoted?</button>
       </div>
     </div>
     <div id="aiAnalysisBody" style="margin-top:8px;"></div>
@@ -7717,13 +7727,15 @@ function _sessExtended(ct){
     h+=`<div class="detail-panel" style="margin-bottom:12px;border-left:4px solid #10b981;">
       <h3>SSH Sessions (${d.ssh.total})</h3>`;
     if(d.ssh.sessions.length){
-      h+=`<div class="tbl-wrap" style="max-height:200px;overflow-y:auto;"><table><tr><th>Time</th><th>Source</th><th>Destination</th><th>Client</th><th>Server</th></tr>`;
+      h+=`<div class="tbl-wrap" style="max-height:200px;overflow-y:auto;"><table><tr><th>Time</th><th>Source</th><th>Destination</th><th>Client</th><th>Server</th><th></th></tr>`;
       d.ssh.sessions.forEach(s=>{
+        const sessJson=JSON.stringify({src_ip:s.src_ip,dst_ip:s.dest_ip,dst_port:22,protocol:'tcp',app_proto:'ssh',start_time:s.timestamp});
         h+=`<tr><td style="font-size:11px;">${esc(s.timestamp)}</td>
           <td class="mono" style="font-size:11px;"><button class="link-btn" onclick="navigateTo('investigate','${esc(s.src_ip)}')">${esc(s.src_ip)}</button></td>
           <td class="mono" style="font-size:11px;">${esc(s.dest_ip)}</td>
           <td style="font-size:11px;">${esc(s.client_version)}</td>
-          <td style="font-size:11px;">${esc(s.server_version)}</td></tr>`;
+          <td style="font-size:11px;">${esc(s.server_version)}</td>
+          <td><button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;font-size:10px;padding:2px 6px;" onclick='aiSessionNarrator(${sessJson.replace(/'/g,"&#39;")})' title="LLM narrates this session">🧠</button></td></tr>`;
       });
       h+=`</table></div>`;
     } else h+=`<div style="font-size:12px;color:var(--text-dim);">No SSH sessions</div>`;
@@ -8567,13 +8579,19 @@ function _renderMonView(){
 
   // Sub-tabs in incident-investigation order — the natural SOC narrative:
   // "What was hit → who hit it → how far → how → what's stopping them → what to add"
-  let h=`<div class="sub-tabs" style="margin-bottom:14px;">
-    <button class="sub-tab ${_monState.view==='list'?'active':''}" onclick="switchMonView('list')" title="What we protect">1. Protected Assets</button>
-    <button class="sub-tab ${_monState.view==='killchain'?'active':''}" onclick="switchMonView('killchain')" title="How far attackers progressed">2. Kill Chain</button>
-    <button class="sub-tab ${_monState.view==='mitre'?'active':''}" onclick="switchMonView('mitre')" title="What techniques they used">3. MITRE ATT&amp;CK</button>
-    <button class="sub-tab ${_monState.view==='rules'?'active':''}" onclick="switchMonView('rules')" title="Current rule coverage">4. Rule Coverage</button>
-    <button class="sub-tab ${_monState.view==='rulemgr'?'active':''}" onclick="switchMonView('rulemgr')" title="Create / edit / delete custom detection rules">5. Rule Manager</button>
-    <button class="sub-tab ${_monState.view==='proposals'?'active':''}" onclick="switchMonView('proposals')" title="Detection gaps to close">6. Rule Proposals</button>
+  let h=`<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px;">
+    <div class="sub-tabs">
+      <button class="sub-tab ${_monState.view==='list'?'active':''}" onclick="switchMonView('list')" title="What we protect">1. Protected Assets</button>
+      <button class="sub-tab ${_monState.view==='killchain'?'active':''}" onclick="switchMonView('killchain')" title="How far attackers progressed">2. Kill Chain</button>
+      <button class="sub-tab ${_monState.view==='mitre'?'active':''}" onclick="switchMonView('mitre')" title="What techniques they used">3. MITRE ATT&amp;CK</button>
+      <button class="sub-tab ${_monState.view==='rules'?'active':''}" onclick="switchMonView('rules')" title="Current rule coverage">4. Rule Coverage</button>
+      <button class="sub-tab ${_monState.view==='rulemgr'?'active':''}" onclick="switchMonView('rulemgr')" title="Create / edit / delete custom detection rules">5. Rule Manager</button>
+      <button class="sub-tab ${_monState.view==='proposals'?'active':''}" onclick="switchMonView('proposals')" title="Detection gaps to close">6. Rule Proposals</button>
+    </div>
+    <div style="display:flex;gap:6px;">
+      <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="aiSuricataStats()" title="LLM interpretation of Suricata engine counters (drops, memory, packets/sec)">🧠 Engine Stats</button>
+      <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="aiMitreGaps()" title="LLM analysis of which MITRE ATT&amp;CK tactics/techniques are under-covered">🧠 MITRE Gaps</button>
+    </div>
   </div>`;
 
   // === ATTACK OUTCOMES HERO (always visible, prominent) ===
@@ -8832,6 +8850,8 @@ function _renderRuleManager(d){
   h+=`<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">
     <button class="btn btn-primary" onclick="_ruleMgrOpen()">+ Create Rule</button>
     <button class="btn" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiRuleGenModal()" title="Describe a detection in plain English — LLM writes the Suricata rule">🧠 AI Generate Rule</button>
+    <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="aiRuleHealth()" title="LLM assesses overall rule set health (dead rules, noisy FPs, MITRE gaps)">🧠 Rule Health</button>
+    <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="aiRuleDedup()" title="LLM finds near-duplicate rules that could be consolidated">🧠 Dedup</button>
     <button class="btn" onclick="_ruleMgrApply()" title="Write all enabled rules to the rules file">Apply &amp; Reload</button>
     <button class="btn" onclick="_deployExt2IntPack()" title="Deploy the bundled External→Internal rule pack (~40 rules covering scan/brute force/exploit/C2/protocol abuse)">Deploy Ext→Int Pack</button>
     <button class="btn" onclick="_deployAssetIdPack()" title="Deploy the Asset-Identification pack: discovery, role drift, identity exposure, insider risk, service drift, BYOD/Shadow IT (~40 rules)">Deploy Asset-ID Pack</button>
@@ -8881,6 +8901,7 @@ function _renderRuleManager(d){
       <td>
         <button class="btn btn-sm" onclick="_ruleMgrToggle(${r.sid},${r.enabled?0:1})" title="${r.enabled?'Disable':'Enable'}">${r.enabled?'Disable':'Enable'}</button>
         <button class="btn btn-sm" onclick="_ruleMgrEdit(${r.sid})">Edit</button>
+        <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="aiRuleImprovement(${r.sid})" title="LLM suggests improvements based on 30-day hit stats">🧠 Improve</button>
         <button class="btn btn-sm" onclick="_ruleMgrDelete(${r.sid})" style="color:var(--critical);">Delete</button>
       </td>
     </tr>`;
@@ -10190,6 +10211,245 @@ function _aiRuleGenModal(){
   </div>`;
   document.body.appendChild(overlay);
   setTimeout(()=>document.getElementById('aiRuleGenDesc').focus(),100);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Session 2 shared modal + feature launchers
+// ══════════════════════════════════════════════════════════════════════
+
+// Open a modal that fires a fetch and renders the result via a caller-supplied render fn.
+// If body is provided, does POST; otherwise GET.
+async function _aiOpenModal(title, url, body, renderFn){
+  const overlay=document.createElement('div');
+  overlay.className='modal-overlay';
+  overlay.onclick=e=>{if(e.target===overlay)overlay.remove();};
+  overlay.innerHTML=`<div class="modal" style="max-width:720px;max-height:90vh;overflow-y:auto;">
+    <h2 style="margin:0 0 4px;">🧠 ${esc(title)}</h2>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;">Local LLM analysis · 15-60s on CPU.</div>
+    <div id="aiSession2Body"><div style="font-size:11px;color:var(--text-dim);">Thinking…</div></div>
+    <div class="actions" style="margin-top:14px;text-align:right;">
+      <button class="btn" onclick="this.closest('.modal-overlay').remove()">Close</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  try{
+    const r = body ? await apiPost(url, body) : await api(url);
+    const bodyEl=document.getElementById('aiSession2Body');
+    if(!bodyEl) return;
+    if(!r || r.error){
+      bodyEl.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">${esc(r?.error||'unknown')}</div>`;
+      return;
+    }
+    bodyEl.innerHTML=renderFn(r);
+  }catch(e){
+    const bodyEl=document.getElementById('aiSession2Body');
+    if(bodyEl) bodyEl.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">${esc(String(e))}</div>`;
+  }
+}
+
+function _aiRenderBullets(items){
+  if(!items||!items.length) return '';
+  return '<ul style="margin:4px 0 0 0;padding-left:18px;font-size:11px;">'+
+    items.map(x=>'<li style="margin:2px 0;">'+esc(typeof x==='string'?x:JSON.stringify(x))+'</li>').join('')+
+    '</ul>';
+}
+function _aiRenderModelFooter(r){
+  return r._model?`<div style="font-size:9px;color:var(--text-dim);margin-top:8px;font-style:italic;">Model: ${esc(r._model)}</div>`:'';
+}
+
+// ── Feature launchers ────────────────────────────────────────────────
+
+// (1) Alerts: bulk-triage suggestion for a signature cluster
+function aiBulkTriage(sid){
+  _aiOpenModal('Bulk-triage suggestion (sid '+sid+')', '/api/ai/bulk-triage/'+sid, null, r=>{
+    const recColors={bulk_close_fp:'#16a34a',bulk_close_tp:'#dc2626',bulk_investigate:'#f59e0b',review_individually:'#6b7280'};
+    const c=recColors[r.recommendation]||'#666';
+    return `<div style="padding:10px 14px;background:${c}22;border-left:3px solid ${c};border-radius:6px;font-size:11px;">
+      <div style="margin-bottom:6px;"><strong style="color:${c};text-transform:uppercase;">${esc((r.recommendation||'').replace(/_/g,' '))}</strong>
+        <span style="font-size:9px;color:var(--text-dim);margin-left:6px;">confidence: ${esc(r.confidence||'?')}</span></div>
+      <div style="margin-bottom:4px;"><strong>Reasoning:</strong> ${esc(r.reasoning||'')}</div>
+      <div style="margin-bottom:4px;"><strong>Why the cluster is coherent:</strong> ${esc(r.why_similar||'')}</div>
+      ${_aiRenderModelFooter(r)}
+    </div>`;
+  });
+}
+
+// (2) Alerts: cluster story
+function aiClusterStory(sid){
+  _aiOpenModal('Alert cluster story (sid '+sid+')', '/api/ai/alert-cluster-story/'+sid, null, r=>{
+    return `<div style="padding:10px 14px;background:rgba(59,130,246,.08);border-left:3px solid #3b82f6;border-radius:6px;font-size:11px;">
+      <div style="margin-bottom:6px;"><strong>Story:</strong> ${esc(r.story||'')}</div>
+      <div style="margin-bottom:6px;"><strong>Likely cause:</strong> ${esc(r.likely_cause||'')}</div>
+      <div><strong>What to check next:</strong> ${esc(r.what_to_check_next||'')}</div>
+      ${_aiRenderModelFooter(r)}
+    </div>`;
+  });
+}
+
+// (3) Incidents: auto-promote reasoning
+function aiAutoPromoteReasoning(incId){
+  _aiOpenModal('Why was this promoted? (INC-'+String(incId).padStart(4,'0')+')',
+    '/api/ai/auto-promote-reasoning/'+incId, null, r=>{
+    const priColors={yes:'#dc2626',no:'#16a34a',maybe:'#f59e0b'};
+    const c=priColors[r.should_analyst_prioritise]||'#666';
+    return `<div style="padding:10px 14px;background:rgba(139,92,246,.08);border-left:3px solid #8b5cf6;border-radius:6px;font-size:11px;">
+      <div style="margin-bottom:6px;"><strong>Why:</strong> ${esc(r.why||'')}</div>
+      <div style="margin-bottom:6px;"><strong>Prioritise?</strong> <span style="color:${c};font-weight:700;text-transform:uppercase;">${esc(r.should_analyst_prioritise||'?')}</span></div>
+      <div><strong>Next step:</strong> ${esc(r.next_step||'')}</div>
+      ${_aiRenderModelFooter(r)}
+    </div>`;
+  });
+}
+
+// (4) Assets: missing asset finder
+function aiMissingAssets(){
+  _aiOpenModal('Missing asset finder', '/api/ai/missing-assets', null, r=>{
+    const renderGroup=(label, items, color)=>{
+      if(!items||!items.length) return '';
+      return `<div style="margin-bottom:10px;">
+        <div style="font-size:10px;color:${color};font-weight:700;text-transform:uppercase;margin-bottom:4px;">${label} (${items.length})</div>
+        ${items.map(x=>`<div style="padding:6px 10px;background:${color}18;border-left:3px solid ${color};border-radius:4px;font-size:11px;margin-bottom:4px;">
+          <strong class="mono">${esc(x.ip||'')}</strong> — ${esc(x.why||'')}
+        </div>`).join('')}
+      </div>`;
+    };
+    return `${renderGroup('High priority', r.high_priority, '#dc2626')}
+      ${renderGroup('Medium priority', r.medium_priority, '#f59e0b')}
+      ${renderGroup('Skip for now', r.skip_for_now, '#6b7280')}
+      ${(!r.high_priority?.length && !r.medium_priority?.length && !r.skip_for_now?.length) ?
+        '<div style="font-size:11px;color:var(--text-dim);padding:8px;">No unregistered internal IPs found in the last 7 days.</div>' : ''}
+      ${_aiRenderModelFooter(r)}`;
+  });
+}
+
+// (5) Anomalies: WHY
+function aiAnomalyWhy(anomType, endpoint, description, sampleIndicators){
+  _aiOpenModal('Why is this anomalous?', '/api/ai/anomaly-why',
+    {type:anomType, endpoint, description, sample_indicators:sampleIndicators}, r=>{
+    return `<div style="padding:10px 14px;background:rgba(245,158,11,.08);border-left:3px solid #f59e0b;border-radius:6px;font-size:11px;">
+      <div style="margin-bottom:6px;"><strong>Likely cause:</strong> ${esc(r.likely_cause||'')}</div>
+      <div style="margin-bottom:6px;"><strong>Reasoning:</strong> ${esc(r.reasoning||'')}</div>
+      <div style="margin-bottom:4px;"><strong>Evidence supporting this:</strong>${_aiRenderBullets(r.evidence_that_supports)}</div>
+      <div><strong>Evidence against:</strong>${_aiRenderBullets(r.evidence_that_contradicts)}</div>
+      ${_aiRenderModelFooter(r)}
+    </div>`;
+  });
+}
+
+// (6) Anomalies: action recommendation
+function aiAnomalyAction(anomType, endpoint, description){
+  _aiOpenModal('Investigate or dismiss?', '/api/ai/anomaly-action',
+    {type:anomType, endpoint, description}, r=>{
+    const actColors={investigate_now:'#dc2626',keep_watching:'#f59e0b',safe_to_dismiss:'#16a34a'};
+    const c=actColors[r.action]||'#666';
+    return `<div style="padding:10px 14px;background:${c}22;border-left:3px solid ${c};border-radius:6px;font-size:11px;">
+      <div style="margin-bottom:6px;"><strong style="color:${c};text-transform:uppercase;">${esc((r.action||'').replace(/_/g,' '))}</strong></div>
+      <div style="margin-bottom:6px;"><strong>Reasoning:</strong> ${esc(r.reasoning||'')}</div>
+      ${r.if_dismiss_add_exception?`<div><strong>Suppression hint:</strong> ${esc(r.exception_hint||'')}</div>`:''}
+      ${_aiRenderModelFooter(r)}
+    </div>`;
+  });
+}
+
+// (7) Sessions: narrator
+function aiSessionNarrator(session){
+  _aiOpenModal('Session narrator', '/api/ai/session-narrator', session, r=>{
+    const riskColors={low:'#16a34a',medium:'#f59e0b',high:'#dc2626'};
+    const c=riskColors[r.risk_indicator]||'#666';
+    return `<div style="padding:10px 14px;background:${c}22;border-left:3px solid ${c};border-radius:6px;font-size:11px;">
+      <div style="margin-bottom:6px;"><strong>Narrative:</strong> ${esc(r.narrative||'')}</div>
+      <div style="margin-bottom:6px;"><strong>Notable:</strong> ${esc(r.notable||'')}</div>
+      <div><strong>Risk:</strong> <span style="color:${c};font-weight:700;text-transform:uppercase;">${esc(r.risk_indicator||'?')}</span></div>
+      ${_aiRenderModelFooter(r)}
+    </div>`;
+  });
+}
+
+// (8) Monitoring: Suricata stats interpreter
+function aiSuricataStats(){
+  _aiOpenModal('Suricata engine stats', '/api/ai/suricata-stats', null, r=>{
+    const hColors={healthy:'#16a34a',degraded:'#f59e0b',unhealthy:'#dc2626'};
+    const c=hColors[r.health]||'#666';
+    return `<div style="padding:10px 14px;background:${c}22;border-left:3px solid ${c};border-radius:6px;font-size:11px;">
+      <div style="margin-bottom:6px;"><strong style="color:${c};text-transform:uppercase;">${esc(r.health||'?')}</strong></div>
+      <div style="margin-bottom:6px;"><strong>Summary:</strong> ${esc(r.summary||'')}</div>
+      ${r.concerns?.length?`<div style="margin-bottom:4px;"><strong>Concerns:</strong>${_aiRenderBullets(r.concerns)}</div>`:''}
+      ${r.action_items?.length?`<div><strong>Action items:</strong>${_aiRenderBullets(r.action_items)}</div>`:''}
+      ${r._raw_sample?`<div style="font-size:9px;color:var(--text-dim);margin-top:8px;">Sample counters: ${esc(JSON.stringify(r._raw_sample))}</div>`:''}
+      ${_aiRenderModelFooter(r)}
+    </div>`;
+  });
+}
+
+// (9) Monitoring: MITRE ATT&CK gap analysis
+function aiMitreGaps(){
+  _aiOpenModal('MITRE ATT&CK gap analysis', '/api/ai/mitre-gaps', null, r=>{
+    const gaps=(r.critical_gaps||[]).map(g=>`<div style="padding:6px 10px;background:rgba(220,38,38,.08);border-left:3px solid #dc2626;border-radius:4px;font-size:11px;margin-bottom:4px;">
+      <strong>${esc(g.tactic||'')}:</strong> ${esc(g.why_matters||'')}
+    </div>`).join('');
+    const recs=(r.recommended_next_rules||[]).map(g=>`<div style="padding:6px 10px;background:rgba(59,130,246,.08);border-left:3px solid #3b82f6;border-radius:4px;font-size:11px;margin-bottom:4px;">
+      <strong class="mono">${esc(g.technique||'')}:</strong> ${esc(g.rule_hint||'')}
+    </div>`).join('');
+    return `<div style="padding:10px 14px;background:rgba(139,92,246,.08);border-left:3px solid #8b5cf6;border-radius:6px;font-size:11px;margin-bottom:10px;">
+      <strong>Coverage summary:</strong> ${esc(r.coverage_summary||'')}
+      <div style="font-size:9px;color:var(--text-dim);margin-top:4px;">Techniques observed in closed incidents: ${r._covered_count||0}</div>
+    </div>
+    ${gaps?`<div style="margin-bottom:10px;"><div style="font-size:10px;color:#dc2626;font-weight:700;text-transform:uppercase;margin-bottom:4px;">Critical gaps</div>${gaps}</div>`:''}
+    ${recs?`<div><div style="font-size:10px;color:#3b82f6;font-weight:700;text-transform:uppercase;margin-bottom:4px;">Recommended next rules</div>${recs}</div>`:''}
+    ${_aiRenderModelFooter(r)}`;
+  });
+}
+
+// (10) Rule Manager: single-rule improvement
+function aiRuleImprovement(sid){
+  _aiOpenModal('Rule improvement (sid '+sid+')', '/api/ai/rule-improvement/'+sid, null, r=>{
+    const impr=(r.improvements||[]).map(x=>`<div style="padding:6px 10px;background:rgba(59,130,246,.08);border-left:3px solid #3b82f6;border-radius:4px;font-size:11px;margin-bottom:4px;">
+      <div><strong>Change:</strong> ${esc(x.change||'')}</div>
+      <div><strong>Why:</strong> ${esc(x.why||'')}</div>
+      <div style="color:var(--text-dim);"><strong>How:</strong> ${esc(x.how_to_apply||'')}</div>
+    </div>`).join('') || '<div style="font-size:11px;color:var(--text-dim);">No suggested changes.</div>';
+    const kColors={keep:'#16a34a',retire:'#dc2626',keep_but_lower_severity:'#f59e0b'};
+    const c=kColors[r.keep_or_retire]||'#666';
+    return `<div style="padding:8px 12px;background:${c}22;border-left:3px solid ${c};border-radius:4px;font-size:11px;margin-bottom:10px;">
+        <strong style="color:${c};text-transform:uppercase;">${esc((r.keep_or_retire||'').replace(/_/g,' '))}</strong>
+        <div style="margin-top:4px;">${esc(r.reasoning||'')}</div>
+      </div>
+      ${impr}
+      ${_aiRenderModelFooter(r)}`;
+  });
+}
+
+// (11) Rule Manager: overall rule set health
+function aiRuleHealth(){
+  _aiOpenModal('Rule set health check', '/api/ai/rule-health', null, r=>{
+    const hColors={healthy:'#16a34a',needs_attention:'#f59e0b',poor:'#dc2626'};
+    const c=hColors[r.overall_health]||'#666';
+    const issues=(r.top_issues||[]).map(i=>`<div style="padding:6px 10px;background:rgba(245,158,11,.08);border-left:3px solid #f59e0b;border-radius:4px;font-size:11px;margin-bottom:4px;">
+      <strong>${esc(i.issue||'')}</strong> ${i.affected_count?`<span style="color:var(--text-dim);font-size:10px;">— ${esc(String(i.affected_count))}</span>`:''}
+    </div>`).join('');
+    return `<div style="padding:10px 14px;background:${c}22;border-left:3px solid ${c};border-radius:6px;font-size:11px;margin-bottom:10px;">
+      <div style="margin-bottom:6px;"><strong style="color:${c};text-transform:uppercase;">${esc((r.overall_health||'').replace(/_/g,' '))}</strong></div>
+      <div>${esc(r.summary||'')}</div>
+    </div>
+    ${issues?`<div style="margin-bottom:10px;"><div style="font-size:10px;color:var(--text-dim);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Top issues</div>${issues}</div>`:''}
+    ${r.recommendations?.length?`<div><div style="font-size:10px;color:var(--text-dim);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Recommendations</div>${_aiRenderBullets(r.recommendations)}</div>`:''}
+    ${_aiRenderModelFooter(r)}`;
+  });
+}
+
+// (12) Rule Manager: near-duplicate finder
+function aiRuleDedup(){
+  _aiOpenModal('Near-duplicate rule finder', '/api/ai/rule-dedup', null, r=>{
+    const groups=(r.duplicate_groups||[]).map(g=>`<div style="padding:8px 12px;background:rgba(245,158,11,.08);border-left:3px solid #f59e0b;border-radius:4px;font-size:11px;margin-bottom:6px;">
+      <div><strong>SIDs:</strong> <span class="mono">${(g.sids||[]).map(esc).join(', ')}</span></div>
+      <div style="margin-top:4px;"><strong>Why they overlap:</strong> ${esc(g.reason||'')}</div>
+    </div>`).join('') || '<div style="font-size:11px;color:var(--text-dim);padding:8px;">No obvious duplicates.</div>';
+    return `<div style="padding:8px 12px;background:rgba(59,130,246,.08);border-left:3px solid #3b82f6;border-radius:6px;font-size:11px;margin-bottom:10px;">
+      ${esc(r.consolidation_savings||'')}
+    </div>
+    ${groups}
+    ${_aiRenderModelFooter(r)}`;
+  });
 }
 
 async function _aiRuleGenGo(btn){

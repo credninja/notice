@@ -900,3 +900,374 @@ def attack_chain_narrative(events):
     if "error" not in r:
         r["_model"] = OLLAMA_MODEL
     return r
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Session 2 features
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Bulk triage suggestion for a cluster of similar alerts ──
+_BULK_TRIAGE_SYSTEM = """You are helping a SOC analyst clear a queue of similar alerts.
+Given a cluster of alerts that all share the same signature, respond in JSON:
+{
+  "recommendation": "bulk_close_fp" | "bulk_close_tp" | "bulk_investigate" | "review_individually",
+  "confidence": "low" | "medium" | "high",
+  "reasoning": "1-2 sentences citing the numbers you were given",
+  "why_similar": "one sentence on what makes these a coherent cluster"
+}
+Rules:
+- Recommend bulk_close_fp only if prior FP ratio for this signature is >70% AND source is internal/known.
+- Recommend bulk_close_tp only if the source is external AND this is a high-severity/known-exploit signature.
+- Otherwise default to review_individually. Never bulk-close on thin evidence."""
+
+
+def bulk_triage_suggestion(cluster_stats):
+    """cluster_stats: {sid, signature, count, src_ips_sample, dst_ips_sample,
+       severity, source_is_external, prior_fp_pct, prior_tp_pct}"""
+    lines = [
+        f"Signature: {cluster_stats.get('signature','?')} (sid={cluster_stats.get('sid','?')})",
+        f"Cluster size: {cluster_stats.get('count',0)} alerts",
+        f"Severity: {cluster_stats.get('severity','?')}",
+        f"Source is external: {cluster_stats.get('source_is_external', False)}",
+        f"Prior verdict history: TP={cluster_stats.get('prior_tp_pct',0)}%, FP={cluster_stats.get('prior_fp_pct',0)}%",
+        f"Sample source IPs: {', '.join(cluster_stats.get('src_ips_sample', [])[:5])}",
+        f"Sample destination IPs: {', '.join(cluster_stats.get('dst_ips_sample', [])[:5])}",
+    ]
+    prompt = "\n".join(lines) + "\n\nProduce the bulk-triage JSON."
+    r = _call_ollama(prompt, system_prompt=_BULK_TRIAGE_SYSTEM, num_predict=250)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Alert cluster story: what does this cluster mean? ──
+_ALERT_CLUSTER_STORY_SYSTEM = """You explain to a SOC analyst what a cluster of related alerts appears to represent.
+Given the cluster's signature, endpoints, and timing, respond in JSON:
+{
+  "story": "2-3 sentence plain-English description of what this pattern suggests",
+  "likely_cause": "one sentence best-guess cause (scanner, misconfigured device, legitimate scan, C2 beacon, etc.)",
+  "what_to_check_next": "one concrete verification step"
+}
+Ground your explanation in the specific IPs / ports / timing. Do not invent details."""
+
+
+def alert_cluster_story(cluster):
+    """cluster: {signature, sid, count, first_seen, last_seen, unique_src_ips,
+                 unique_dst_ips, common_dst_port, span_minutes}"""
+    lines = [
+        f"Signature: {cluster.get('signature','?')} (sid={cluster.get('sid','?')})",
+        f"Alerts in cluster: {cluster.get('count',0)}",
+        f"First seen: {cluster.get('first_seen','?')}",
+        f"Last seen: {cluster.get('last_seen','?')}",
+        f"Duration: {cluster.get('span_minutes','?')} minutes",
+        f"Unique source IPs: {cluster.get('unique_src_ips',0)}",
+        f"Unique destination IPs: {cluster.get('unique_dst_ips',0)}",
+        f"Most common destination port: {cluster.get('common_dst_port','?')}",
+    ]
+    prompt = "\n".join(lines) + "\n\nProduce the cluster-story JSON."
+    r = _call_ollama(prompt, system_prompt=_ALERT_CLUSTER_STORY_SYSTEM, num_predict=250)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Auto-promote reasoning: why did this alert become an incident? ──
+_AUTO_PROMOTE_REASONING_SYSTEM = """You explain WHY an alert was auto-promoted to an incident, in plain English.
+Given the alert and the promotion rule that fired, respond in JSON:
+{
+  "why": "2-3 sentences explaining what triggered promotion (severity + IOC score + burst + phase + critical-asset factors)",
+  "should_analyst_prioritise": "yes" | "no" | "maybe",
+  "next_step": "one concrete first triage step"
+}
+Base your explanation on the actual rule factors that were met. Do not invent factors that were not provided."""
+
+
+def auto_promote_reasoning(alert, rule_hits):
+    """alert: dict with severity/signature/src/dst/etc.
+       rule_hits: dict of factors that met the promotion rule (e.g. {'severity_ok':True, 'ioc_score':45, 'burst':12, 'critical_asset':True})"""
+    lines = [
+        f"Alert signature: {alert.get('signature','?')} (sid={alert.get('sid','?')})",
+        f"Severity: {alert.get('severity','?')}",
+        f"Source: {alert.get('src_ip','?')}, Destination: {alert.get('dest_ip','?')}",
+        f"Kill-chain phase: {alert.get('phase','?')}",
+        "",
+        "Rule factors that were met:",
+    ]
+    for k, v in (rule_hits or {}).items():
+        lines.append(f"  {k}: {v}")
+    prompt = "\n".join(lines) + "\n\nProduce the auto-promote reasoning JSON."
+    r = _call_ollama(prompt, system_prompt=_AUTO_PROMOTE_REASONING_SYSTEM, num_predict=250)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Missing asset finder: which unregistered IPs should be onboarded? ──
+_MISSING_ASSET_SYSTEM = """You help a SOC analyst decide which unregistered internal IPs should be added to the asset inventory.
+Given a list of active-but-unregistered internal IPs with basic activity stats, respond in JSON:
+{
+  "high_priority": [{"ip":"...", "why":"one sentence — traffic volume, listening ports, or role hint"}],
+  "medium_priority": [{"ip":"...", "why":"..."}],
+  "skip_for_now": [{"ip":"...", "why":"why it's low-value to register"}]
+}
+Rules:
+- High priority: IPs with heavy traffic, listening services (SSH/RDP/HTTP), or repeat appearance in alerts.
+- Medium priority: IPs with modest steady traffic but no listening services.
+- Skip: IPs with a single burst of DHCP-only or one-shot activity.
+- Only include IPs from the input. Do not invent any IP addresses."""
+
+
+def missing_asset_finder(unregistered_ips):
+    """unregistered_ips: list of dicts {ip, flow_count, listening_ports, alert_count, days_seen}"""
+    if not unregistered_ips:
+        return {"high_priority": [], "medium_priority": [], "skip_for_now": [],
+                "_note": "no unregistered internal IPs found"}
+    lines = ["Unregistered internal IPs seen recently (sorted by activity):"]
+    for a in unregistered_ips[:15]:
+        lp = ",".join(str(p) for p in a.get("listening_ports", [])[:5]) or "none"
+        lines.append(
+            f"  {a['ip']}: flows={a.get('flow_count',0)}, "
+            f"alerts={a.get('alert_count',0)}, days_seen={a.get('days_seen',0)}, "
+            f"listening_ports=[{lp}]"
+        )
+    prompt = "\n".join(lines) + "\n\nProduce the missing-asset JSON."
+    r = _call_ollama(prompt, system_prompt=_MISSING_ASSET_SYSTEM, num_predict=400)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Anomaly WHY: root cause hypothesis ──
+_ANOMALY_WHY_SYSTEM = """You hypothesize the root cause of a detected anomaly for a SOC analyst.
+Given a specific anomaly (DGA, DNS tunnel, beacon, scan, lateral movement, etc.) and the evidence, respond in JSON:
+{
+  "likely_cause": "one-line best hypothesis (compromise, misconfig, legitimate but noisy tool, tester, etc.)",
+  "reasoning": "2-3 sentences explaining the hypothesis using the evidence",
+  "evidence_that_supports": ["short bullet 1", "short bullet 2"],
+  "evidence_that_contradicts": ["bullet or 'none'"]
+}
+Ground the hypothesis in the provided IPs / domains / patterns. Do not invent evidence."""
+
+
+def anomaly_why(anomaly):
+    """anomaly: dict with type, endpoint, description, sample_indicators"""
+    lines = [
+        f"Anomaly type: {anomaly.get('type','?')}",
+        f"Endpoint: {anomaly.get('endpoint','?')}",
+        f"Description: {anomaly.get('description','?')}",
+        f"Sample indicators: {anomaly.get('sample_indicators','?')}",
+    ]
+    prompt = "\n".join(lines) + "\n\nProduce the anomaly-why JSON."
+    r = _call_ollama(prompt, system_prompt=_ANOMALY_WHY_SYSTEM, num_predict=300)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Anomaly action recommendation: investigate or dismiss? ──
+_ANOMALY_ACTION_SYSTEM = """You help a SOC analyst decide whether an anomaly is worth investigating or can be safely dismissed.
+Given the anomaly and any context, respond in JSON:
+{
+  "action": "investigate_now" | "keep_watching" | "safe_to_dismiss",
+  "reasoning": "1-2 sentences explaining the call",
+  "if_dismiss_add_exception": true | false,
+  "exception_hint": "if the recommendation is dismiss, one line for what suppression rule would remove this noise (e.g. 'suppress DNS anomalies from 10.4.20.21' — else empty string)"
+}
+Rules:
+- investigate_now only when the evidence is strong and the endpoint is not a known service host.
+- keep_watching when the pattern is worrying but the volume is low or the source is unclassified.
+- safe_to_dismiss when it looks like known-legitimate tooling or a registered service (recursive DNS server, monitoring probe, etc.)."""
+
+
+def anomaly_action_recommendation(anomaly, endpoint_context):
+    """endpoint_context: {is_registered_asset, asset_type, asset_owner, prior_anomalies_dismissed}"""
+    lines = [
+        f"Anomaly type: {anomaly.get('type','?')}",
+        f"Endpoint: {anomaly.get('endpoint','?')}",
+        f"Evidence: {anomaly.get('description','?')}",
+        f"Endpoint registered as asset: {endpoint_context.get('is_registered_asset', False)}",
+        f"Asset type: {endpoint_context.get('asset_type','unknown')}",
+        f"Asset owner: {endpoint_context.get('asset_owner','unknown')}",
+        f"Prior dismissed anomalies from this endpoint: {endpoint_context.get('prior_anomalies_dismissed', 0)}",
+    ]
+    prompt = "\n".join(lines) + "\n\nProduce the action recommendation JSON."
+    r = _call_ollama(prompt, system_prompt=_ANOMALY_ACTION_SYSTEM, num_predict=250)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Session narrator ──
+_SESSION_NARRATOR_SYSTEM = """You narrate a network session (a single flow between two IPs) for a SOC analyst.
+Given the session metadata, respond in JSON:
+{
+  "narrative": "2-3 sentence description of what this session likely represents — application, direction, and volume",
+  "notable": "one sentence on anything unusual — long duration, huge byte count, off-hours, weird port, etc.",
+  "risk_indicator": "low" | "medium" | "high"
+}
+Only mark high risk when there are clear signs of exfiltration, command-and-control patterns, or scanning."""
+
+
+def session_narrator(session):
+    """session: {src_ip, dst_ip, dst_port, protocol, bytes_toclient, bytes_toserver, duration_sec, app_proto, start_time}"""
+    lines = [
+        f"Session: {session.get('src_ip','?')} -> {session.get('dst_ip','?')}:{session.get('dst_port','?')}",
+        f"Protocol: {session.get('protocol','?')} / app: {session.get('app_proto','?')}",
+        f"Started: {session.get('start_time','?')}",
+        f"Duration: {session.get('duration_sec','?')} seconds",
+        f"Bytes to server: {session.get('bytes_toserver',0)}, to client: {session.get('bytes_toclient',0)}",
+    ]
+    prompt = "\n".join(lines) + "\n\nProduce the session-narrator JSON."
+    r = _call_ollama(prompt, system_prompt=_SESSION_NARRATOR_SYSTEM, num_predict=250)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Suricata stats interpreter ──
+_SURICATA_STATS_SYSTEM = """You interpret Suricata engine stats for an operator who is not a Suricata expert.
+Given the raw counters, respond in JSON:
+{
+  "health": "healthy" | "degraded" | "unhealthy",
+  "summary": "1-2 sentence plain-English overview (packets/sec, drops, memory)",
+  "concerns": ["short bullet 1", "short bullet 2"],
+  "action_items": ["short bullet 1", "short bullet 2"]
+}
+Rules:
+- Drop % over 1% is 'degraded'; over 5% is 'unhealthy'.
+- Memory near cap or ftp/http parser errors trending up are also concerns.
+- If nothing is wrong, return empty arrays for concerns and action_items."""
+
+
+def suricata_stats_interpreter(stats):
+    """stats: dict of engine counters (packets, drops, mem, etc.)"""
+    lines = ["Suricata engine stats:"]
+    for k, v in list(stats.items())[:30]:
+        lines.append(f"  {k}: {v}")
+    prompt = "\n".join(lines) + "\n\nProduce the interpretation JSON."
+    r = _call_ollama(prompt, system_prompt=_SURICATA_STATS_SYSTEM, num_predict=350)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── MITRE ATT&CK gap analysis ──
+_MITRE_GAP_SYSTEM = """You perform a MITRE ATT&CK coverage gap analysis for a SOC's detection rule set.
+Given the list of covered techniques and the list of ATT&CK tactics we care about, respond in JSON:
+{
+  "coverage_summary": "1-2 sentence high-level assessment (X of Y tactics covered)",
+  "critical_gaps": [{"tactic":"...","why_matters":"one line"}],
+  "recommended_next_rules": [{"technique":"T1234","rule_hint":"one-line rule idea"}]
+}
+Focus on the tactics that are entirely uncovered or under-covered (only 1 rule). Prioritise Initial Access, Execution, Persistence, Credential Access, Lateral Movement, and Exfiltration."""
+
+
+def mitre_gap_analysis(covered_techniques, all_tactics):
+    """covered_techniques: list of {technique_id, tactic, rule_count}
+       all_tactics: list of tactic names we consider important"""
+    lines = ["Covered ATT&CK techniques (by rule count):"]
+    for t in covered_techniques[:40]:
+        lines.append(f"  {t.get('technique_id','?')} ({t.get('tactic','?')}): {t.get('rule_count',0)} rules")
+    lines.append("")
+    lines.append(f"Tactics we care about: {', '.join(all_tactics)}")
+    prompt = "\n".join(lines) + "\n\nProduce the gap analysis JSON."
+    r = _call_ollama(prompt, system_prompt=_MITRE_GAP_SYSTEM, num_predict=500)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Rule improvement ──
+_RULE_IMPROVEMENT_SYSTEM = """You suggest concrete improvements to a Suricata rule based on its recent behaviour.
+Given the rule text and its hit stats (TP vs FP ratios, hit volume), respond in JSON:
+{
+  "improvements": [
+    {"change":"one-line rule tweak","why":"one line","how_to_apply":"which rule option to add/change (threshold, content, flowbits, etc.)"}
+  ],
+  "keep_or_retire": "keep" | "retire" | "keep_but_lower_severity",
+  "reasoning": "one paragraph tying the suggestions to the stats"
+}
+Rules:
+- If TP=0 and FP>10, recommend retire or big scoping change.
+- If TP:FP is 1:5+ but the rule still fires TPs occasionally, suggest a threshold or content anchor.
+- Never suggest changing sid or msg (those are inventory)."""
+
+
+def rule_improvement(rule_text, hit_stats):
+    """hit_stats: {total_hits, tp, fp, avg_hits_per_day, top_src_ips, top_dst_ips}"""
+    lines = [
+        f"Rule: {rule_text[:400]}",
+        f"Total hits: {hit_stats.get('total_hits',0)}",
+        f"Verdicts: TP={hit_stats.get('tp',0)}, FP={hit_stats.get('fp',0)}",
+        f"Average hits per day: {hit_stats.get('avg_hits_per_day',0)}",
+        f"Top source IPs: {', '.join(hit_stats.get('top_src_ips', [])[:5])}",
+        f"Top destination IPs: {', '.join(hit_stats.get('top_dst_ips', [])[:5])}",
+    ]
+    prompt = "\n".join(lines) + "\n\nProduce the improvement JSON."
+    r = _call_ollama(prompt, system_prompt=_RULE_IMPROVEMENT_SYSTEM, num_predict=400)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Rule health check ──
+_RULE_HEALTH_SYSTEM = """You assess the overall health of a Suricata rule set.
+Given aggregate stats across the rules, respond in JSON:
+{
+  "overall_health": "healthy" | "needs_attention" | "poor",
+  "summary": "2-3 sentence overview",
+  "top_issues": [{"issue":"one line","affected_count":"integer or 'many'"}],
+  "recommendations": ["short bullet 1", "short bullet 2", "short bullet 3"]
+}
+Rules:
+- Consider these health signals: many rules with 0 hits (dead rules), many rules with 100% FP (noisy rules), MITRE coverage gaps, rule counts by severity balance."""
+
+
+def rule_health_check(agg_stats):
+    """agg_stats: {total_rules, silent_rules, noisy_fp_rules, by_severity:{critical,high,medium,low},
+                   mitre_coverage_pct, last_updated}"""
+    lines = [
+        f"Total rules: {agg_stats.get('total_rules',0)}",
+        f"Silent rules (0 hits in 30d): {agg_stats.get('silent_rules',0)}",
+        f"Noisy FP rules (100% FP in last 30d): {agg_stats.get('noisy_fp_rules',0)}",
+        f"By severity: {agg_stats.get('by_severity',{})}",
+        f"MITRE ATT&CK coverage: {agg_stats.get('mitre_coverage_pct',0)}%",
+        f"Rule set last updated: {agg_stats.get('last_updated','unknown')}",
+    ]
+    prompt = "\n".join(lines) + "\n\nProduce the health check JSON."
+    r = _call_ollama(prompt, system_prompt=_RULE_HEALTH_SYSTEM, num_predict=400)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Rule dedup finder ──
+_RULE_DEDUP_SYSTEM = """You find near-duplicate Suricata rules that a SOC operator could consolidate.
+Given a list of rules (sid, msg, protocol, content), respond in JSON:
+{
+  "duplicate_groups": [
+    {"sids":[123,456], "reason":"one sentence why they overlap"}
+  ],
+  "consolidation_savings": "one line — 'You could remove N rules' or 'No meaningful duplicates found'"
+}
+Rules:
+- Only flag rules that clearly overlap in content/direction/protocol. Do not flag rules that just share a message keyword.
+- If unsure, err on side of listing fewer groups. Never invent sids that weren't provided."""
+
+
+def rule_dedup_finder(rules):
+    """rules: list of {sid, msg, protocol, content, action, direction}"""
+    if not rules:
+        return {"duplicate_groups": [], "consolidation_savings": "no rules to analyse"}
+    lines = [f"Rule set ({len(rules)} rules):"]
+    for r in rules[:80]:
+        lines.append(
+            f"  sid={r.get('sid','?')} {r.get('action','alert')} {r.get('protocol','?')} "
+            f"{r.get('direction','->')} msg=\"{(r.get('msg','') or '')[:80]}\" "
+            f"content=\"{(r.get('content','') or '')[:60]}\""
+        )
+    prompt = "\n".join(lines) + "\n\nProduce the dedup analysis JSON."
+    r = _call_ollama(prompt, system_prompt=_RULE_DEDUP_SYSTEM, num_predict=500)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r

@@ -10,6 +10,7 @@ in 'triage' and the first phase log row is opened. Calling
 """
 
 import json
+import os
 import re
 import ipaddress
 from bottle import request, response
@@ -2987,3 +2988,446 @@ def register(app):
         conn.commit()
         conn.close()
         return {"ok": True, "seeded": len(defaults)}
+
+    # ══════════════════════════════════════════════════════════════════
+    # Session 2 AI endpoints
+    # ══════════════════════════════════════════════════════════════════
+
+    # ── Alerts: bulk-triage suggestion for a signature-cluster ──
+    @app.get("/api/ai/bulk-triage/<sid:int>")
+    def ai_bulk_triage(sid):
+        try:
+            from analyzers.llm_assistant import bulk_triage_suggestion
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        row = conn.execute(
+            "SELECT signature, severity, COUNT(*) as c FROM ingested_alerts WHERE signature_id=? "
+            "AND timestamp > datetime('now','-7 days','localtime') GROUP BY signature, severity "
+            "ORDER BY c DESC LIMIT 1",
+            (sid,)
+        ).fetchone()
+        if not row or row["c"] == 0:
+            conn.close(); return {"error": f"no recent alerts for sid={sid}"}
+        src_ips = [r["src_ip"] for r in conn.execute(
+            "SELECT DISTINCT src_ip FROM ingested_alerts WHERE signature_id=? "
+            "AND timestamp > datetime('now','-7 days','localtime') LIMIT 8", (sid,)
+        ).fetchall()]
+        dst_ips = [r["dest_ip"] for r in conn.execute(
+            "SELECT DISTINCT dest_ip FROM ingested_alerts WHERE signature_id=? "
+            "AND timestamp > datetime('now','-7 days','localtime') LIMIT 8", (sid,)
+        ).fetchall()]
+        # Prior verdict split for the signature
+        v_rows = conn.execute(
+            "SELECT verdict, COUNT(*) as c FROM incidents WHERE signature_id=? "
+            "AND status='closed' GROUP BY verdict", (sid,)
+        ).fetchall()
+        v_total = sum(r["c"] for r in v_rows) or 1
+        tp = sum(r["c"] for r in v_rows if r["verdict"] == "true_positive")
+        fp = sum(r["c"] for r in v_rows if r["verdict"] == "false_positive")
+        conn.close()
+        source_external = any(not (s or "").startswith(("10.","172.16.","172.17.","172.18.","172.19.",
+                                                         "172.2","172.30.","172.31.","192.168."))
+                              for s in src_ips)
+        r = bulk_triage_suggestion({
+            "sid": sid, "signature": row["signature"], "count": row["c"],
+            "src_ips_sample": src_ips, "dst_ips_sample": dst_ips,
+            "severity": row["severity"], "source_is_external": source_external,
+            "prior_tp_pct": round(tp * 100 / v_total) if v_total else 0,
+            "prior_fp_pct": round(fp * 100 / v_total) if v_total else 0,
+        })
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Alerts: cluster story for a signature ──
+    @app.get("/api/ai/alert-cluster-story/<sid:int>")
+    def ai_alert_cluster_story(sid):
+        try:
+            from analyzers.llm_assistant import alert_cluster_story
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        r = conn.execute(
+            "SELECT signature, COUNT(*) as c, MIN(timestamp) as first_seen, "
+            "MAX(timestamp) as last_seen, COUNT(DISTINCT src_ip) as usrc, "
+            "COUNT(DISTINCT dest_ip) as udst "
+            "FROM ingested_alerts WHERE signature_id=? "
+            "AND timestamp > datetime('now','-24 hours','localtime')", (sid,)
+        ).fetchone()
+        if not r or r["c"] == 0:
+            conn.close(); return {"error": f"no alerts in last 24h for sid={sid}"}
+        # common dst port
+        port_row = conn.execute(
+            "SELECT dest_port, COUNT(*) as c FROM ingested_alerts WHERE signature_id=? "
+            "AND timestamp > datetime('now','-24 hours','localtime') "
+            "AND dest_port IS NOT NULL GROUP BY dest_port ORDER BY c DESC LIMIT 1", (sid,)
+        ).fetchone()
+        conn.close()
+        # duration in minutes
+        from datetime import datetime as _dt
+        span_min = 0
+        try:
+            f = _dt.fromisoformat((r["first_seen"] or "").replace("Z",""))
+            l = _dt.fromisoformat((r["last_seen"]  or "").replace("Z",""))
+            span_min = int((l - f).total_seconds() / 60)
+        except Exception:
+            pass
+        out = alert_cluster_story({
+            "sid": sid, "signature": r["signature"], "count": r["c"],
+            "first_seen": r["first_seen"], "last_seen": r["last_seen"],
+            "span_minutes": span_min,
+            "unique_src_ips": r["usrc"], "unique_dst_ips": r["udst"],
+            "common_dst_port": port_row["dest_port"] if port_row else "n/a",
+        })
+        if "error" in out: response.status = 503
+        return out
+
+    # ── Incidents: auto-promote reasoning ──
+    @app.get("/api/ai/auto-promote-reasoning/<incident_id:int>")
+    def ai_auto_promote_reasoning(incident_id):
+        try:
+            from analyzers.llm_assistant import auto_promote_reasoning
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        inc = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+        if not inc:
+            conn.close(); response.status = 404; return {"error": "Incident not found"}
+        inc = dict(inc)
+        # Best-effort factors: severity, whether source external, whether victim is critical asset,
+        # burst count for this sig in last 15 min, prior TP/FP ratio.
+        src = inc.get("attacker_ip") or ""
+        source_external = not (src.startswith(("10.","172.16.","172.17.","172.18.","172.19.",
+                                                "172.2","172.30.","172.31.","192.168.")))
+        burst = conn.execute(
+            "SELECT COUNT(*) as c FROM ingested_alerts WHERE signature_id=? "
+            "AND timestamp > datetime('now','-15 minutes','localtime')",
+            (inc.get("signature_id"),)
+        ).fetchone()["c"] if inc.get("signature_id") else 0
+        crit_asset = False
+        if inc.get("victim_ip"):
+            row = conn.execute(
+                "SELECT business_critical FROM assets WHERE ip=?", (inc["victim_ip"],)
+            ).fetchone()
+            crit_asset = bool(row and row["business_critical"])
+        conn.close()
+        rule_hits = {
+            "severity": inc.get("severity",""),
+            "severity_qualifies": inc.get("severity") in ("critical","high"),
+            "source_is_external": source_external,
+            "burst_last_15min": burst,
+            "burst_qualifies": burst >= 3,
+            "victim_is_critical_asset": crit_asset,
+            "kill_chain_phase": inc.get("phase",""),
+        }
+        r = auto_promote_reasoning({
+            "signature": inc.get("signature",""),
+            "sid": inc.get("signature_id",""),
+            "severity": inc.get("severity",""),
+            "src_ip": src, "dest_ip": inc.get("victim_ip",""),
+            "phase": inc.get("phase",""),
+        }, rule_hits)
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Assets: missing asset finder ──
+    @app.get("/api/ai/missing-assets")
+    def ai_missing_assets():
+        try:
+            from analyzers.llm_assistant import missing_asset_finder
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        # IPs that appear in alerts but aren't in assets
+        rows = conn.execute("""
+            SELECT ip, alert_count, days_seen FROM (
+                SELECT src_ip AS ip, COUNT(*) AS alert_count,
+                       COUNT(DISTINCT date(timestamp)) AS days_seen
+                FROM ingested_alerts
+                WHERE timestamp > datetime('now','-7 days','localtime')
+                  AND (src_ip LIKE '10.%' OR src_ip LIKE '172.16.%' OR src_ip LIKE '172.17.%'
+                       OR src_ip LIKE '172.18.%' OR src_ip LIKE '172.19.%'
+                       OR src_ip LIKE '172.2%.' OR src_ip LIKE '172.30.%'
+                       OR src_ip LIKE '172.31.%' OR src_ip LIKE '192.168.%')
+                GROUP BY src_ip
+                UNION ALL
+                SELECT dest_ip AS ip, COUNT(*) AS alert_count,
+                       COUNT(DISTINCT date(timestamp)) AS days_seen
+                FROM ingested_alerts
+                WHERE timestamp > datetime('now','-7 days','localtime')
+                  AND (dest_ip LIKE '10.%' OR dest_ip LIKE '172.16.%' OR dest_ip LIKE '192.168.%')
+                GROUP BY dest_ip
+            )
+            WHERE ip NOT IN (SELECT ip FROM assets)
+            GROUP BY ip
+            ORDER BY SUM(alert_count) DESC LIMIT 15
+        """).fetchall()
+        candidates = []
+        for r in rows:
+            candidates.append({
+                "ip": r["ip"],
+                "alert_count": r["alert_count"],
+                "days_seen": r["days_seen"],
+                "flow_count": r["alert_count"],
+                "listening_ports": [],
+            })
+        conn.close()
+        r = missing_asset_finder(candidates)
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Anomalies: WHY hypothesis ──
+    @app.post("/api/ai/anomaly-why")
+    def ai_anomaly_why():
+        try:
+            from analyzers.llm_assistant import anomaly_why
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        data = request.json or {}
+        r = anomaly_why({
+            "type": data.get("type", "unknown"),
+            "endpoint": data.get("endpoint", ""),
+            "description": data.get("description", ""),
+            "sample_indicators": data.get("sample_indicators", ""),
+        })
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Anomalies: action recommendation ──
+    @app.post("/api/ai/anomaly-action")
+    def ai_anomaly_action():
+        try:
+            from analyzers.llm_assistant import anomaly_action_recommendation
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        data = request.json or {}
+        endpoint = data.get("endpoint", "")
+        conn = get_db()
+        row = None
+        if endpoint:
+            row = conn.execute(
+                "SELECT asset_type, owner, business_critical FROM assets WHERE ip=?", (endpoint,)
+            ).fetchone()
+        conn.close()
+        ctx = {
+            "is_registered_asset": bool(row),
+            "asset_type": row["asset_type"] if row else "unknown",
+            "asset_owner": row["owner"] if row else "unknown",
+            "prior_anomalies_dismissed": 0,
+        }
+        r = anomaly_action_recommendation({
+            "type": data.get("type", "unknown"),
+            "endpoint": endpoint,
+            "description": data.get("description", ""),
+        }, ctx)
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Sessions: narrator ──
+    @app.post("/api/ai/session-narrator")
+    def ai_session_narrator():
+        try:
+            from analyzers.llm_assistant import session_narrator
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        data = request.json or {}
+        r = session_narrator(data)
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Monitoring: Suricata stats interpreter ──
+    @app.get("/api/ai/suricata-stats")
+    def ai_suricata_stats():
+        try:
+            from analyzers.llm_assistant import suricata_stats_interpreter
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        # Best-effort: read stats.log if configured, else use a small aggregate from the DB.
+        stats = {}
+        stats_path = os.environ.get("SURICATA_STATS_LOG", "/var/log/suricata/stats.log")
+        try:
+            if os.path.exists(stats_path):
+                with open(stats_path, "r") as f:
+                    lines = f.readlines()[-200:]  # tail
+                for ln in lines:
+                    if "|" in ln and "." in ln:
+                        parts = [p.strip() for p in ln.split("|")]
+                        if len(parts) >= 3:
+                            key, _, val = parts[0], parts[1], parts[-1]
+                            if key and val and val.strip().replace(".","").isdigit():
+                                stats[key] = val
+        except Exception:
+            pass
+        if not stats:
+            # Fallback: derive rough numbers from the alert index.
+            conn = get_db()
+            try:
+                stats["alerts_last_hour"] = conn.execute(
+                    "SELECT COUNT(*) as c FROM ingested_alerts WHERE timestamp > datetime('now','-1 hour','localtime')"
+                ).fetchone()["c"]
+                stats["alerts_last_24h"] = conn.execute(
+                    "SELECT COUNT(*) as c FROM ingested_alerts WHERE timestamp > datetime('now','-24 hours','localtime')"
+                ).fetchone()["c"]
+                stats["_note"] = "stats.log not found — showing DB-derived alert counts only"
+            except Exception:
+                pass
+            conn.close()
+        r = suricata_stats_interpreter(stats)
+        if "error" in r: response.status = 503
+        r["_raw_sample"] = dict(list(stats.items())[:8])
+        return r
+
+    # ── Monitoring: MITRE gap analysis ──
+    @app.get("/api/ai/mitre-gaps")
+    def ai_mitre_gaps():
+        try:
+            from analyzers.llm_assistant import mitre_gap_analysis
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        # Simple coverage read: from incidents table's mitre_tactic column, count distinct tactics.
+        rows = conn.execute(
+            "SELECT closure_mitre_tactic AS tactic, closure_mitre_technique AS technique_id, "
+            "COUNT(*) AS c FROM incidents WHERE closure_mitre_technique IS NOT NULL "
+            "AND closure_mitre_technique != '' GROUP BY closure_mitre_tactic, closure_mitre_technique"
+        ).fetchall()
+        conn.close()
+        covered = [{"technique_id": r["technique_id"], "tactic": r["tactic"], "rule_count": r["c"]}
+                   for r in rows]
+        tactics = ["Reconnaissance", "Initial Access", "Execution", "Persistence",
+                   "Privilege Escalation", "Defense Evasion", "Credential Access",
+                   "Discovery", "Lateral Movement", "Collection", "Command and Control",
+                   "Exfiltration", "Impact"]
+        r = mitre_gap_analysis(covered, tactics)
+        if "error" in r: response.status = 503
+        r["_covered_count"] = len(covered)
+        return r
+
+    # ── Rules: improvement suggestion for a single rule ──
+    @app.get("/api/ai/rule-improvement/<sid:int>")
+    def ai_rule_improvement(sid):
+        try:
+            from analyzers.llm_assistant import rule_improvement
+            from analyzers.suricata_rules import get_rule_by_sid
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        rule = get_rule_by_sid(sid)
+        if not rule:
+            response.status = 404; return {"error": f"no rule with sid={sid}"}
+        rule_text = rule.get("raw") or rule.get("raw_line") or ""
+        conn = get_db()
+        total_hits = conn.execute(
+            "SELECT COUNT(*) as c FROM ingested_alerts WHERE signature_id=? "
+            "AND timestamp > datetime('now','-30 days','localtime')", (sid,)
+        ).fetchone()["c"]
+        v_rows = conn.execute(
+            "SELECT verdict, COUNT(*) as c FROM incidents WHERE signature_id=? "
+            "AND status='closed' AND resolved_at > datetime('now','-30 days','localtime') "
+            "GROUP BY verdict", (sid,)
+        ).fetchall()
+        tp = sum(r["c"] for r in v_rows if r["verdict"] == "true_positive")
+        fp = sum(r["c"] for r in v_rows if r["verdict"] == "false_positive")
+        top_src = [r["src_ip"] for r in conn.execute(
+            "SELECT src_ip, COUNT(*) as c FROM ingested_alerts WHERE signature_id=? "
+            "AND timestamp > datetime('now','-30 days','localtime') "
+            "GROUP BY src_ip ORDER BY c DESC LIMIT 5", (sid,)
+        ).fetchall()]
+        top_dst = [r["dest_ip"] for r in conn.execute(
+            "SELECT dest_ip, COUNT(*) as c FROM ingested_alerts WHERE signature_id=? "
+            "AND timestamp > datetime('now','-30 days','localtime') "
+            "GROUP BY dest_ip ORDER BY c DESC LIMIT 5", (sid,)
+        ).fetchall()]
+        conn.close()
+        r = rule_improvement(rule_text, {
+            "total_hits": total_hits, "tp": tp, "fp": fp,
+            "avg_hits_per_day": round(total_hits / 30, 1),
+            "top_src_ips": top_src, "top_dst_ips": top_dst,
+        })
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Rules: overall health check ──
+    @app.get("/api/ai/rule-health")
+    def ai_rule_health():
+        try:
+            from analyzers.llm_assistant import rule_health_check
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        # Silent rules = rules that appeared in the DB but had 0 alerts in 30d.
+        # We approximate: total distinct sids known = alerts + user_rules, silent = user_rules with no alerts.
+        try:
+            total_user_rules = conn.execute("SELECT COUNT(*) as c FROM user_rules").fetchone()["c"]
+        except Exception:
+            total_user_rules = 0
+        try:
+            active_sids = {r["sid"] for r in conn.execute(
+                "SELECT DISTINCT signature_id as sid FROM ingested_alerts "
+                "WHERE timestamp > datetime('now','-30 days','localtime')"
+            ).fetchall()}
+        except Exception:
+            active_sids = set()
+        try:
+            user_sids = [r["sid"] for r in conn.execute("SELECT sid FROM user_rules").fetchall()]
+        except Exception:
+            user_sids = []
+        silent = sum(1 for s in user_sids if s not in active_sids)
+        # noisy_fp: rules with all closures = FP in last 30d
+        noisy = 0
+        try:
+            noisy_rows = conn.execute(
+                "SELECT signature_id, "
+                "SUM(CASE WHEN verdict='false_positive' THEN 1 ELSE 0 END) as fp, "
+                "COUNT(*) as tot FROM incidents "
+                "WHERE status='closed' AND signature_id IS NOT NULL "
+                "AND resolved_at > datetime('now','-30 days','localtime') "
+                "GROUP BY signature_id HAVING tot >= 3 AND fp = tot"
+            ).fetchall()
+            noisy = len(noisy_rows)
+        except Exception:
+            pass
+        by_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        try:
+            for r in conn.execute(
+                "SELECT severity, COUNT(*) as c FROM ingested_alerts "
+                "WHERE timestamp > datetime('now','-30 days','localtime') GROUP BY severity"
+            ).fetchall():
+                lvl = "critical" if r["severity"] == 1 else "high" if r["severity"] == 2 else "medium" if r["severity"] == 3 else "low"
+                by_sev[lvl] += r["c"]
+        except Exception:
+            pass
+        conn.close()
+        r = rule_health_check({
+            "total_rules": total_user_rules + len(active_sids),
+            "silent_rules": silent,
+            "noisy_fp_rules": noisy,
+            "by_severity": by_sev,
+            "mitre_coverage_pct": 0,  # would need a full MITRE map to compute honestly
+            "last_updated": "unknown",
+        })
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Rules: near-duplicate finder ──
+    @app.get("/api/ai/rule-dedup")
+    def ai_rule_dedup():
+        try:
+            from analyzers.llm_assistant import rule_dedup_finder
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        rules = []
+        try:
+            rows = conn.execute(
+                "SELECT sid, msg, protocol, content, action, direction FROM user_rules "
+                "WHERE enabled=1 ORDER BY sid LIMIT 80"
+            ).fetchall()
+            rules = [dict(r) for r in rows]
+        except Exception:
+            pass
+        conn.close()
+        if not rules:
+            return {"duplicate_groups": [], "consolidation_savings": "no user rules to analyse"}
+        r = rule_dedup_finder(rules)
+        if "error" in r: response.status = 503
+        return r
