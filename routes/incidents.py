@@ -1799,6 +1799,374 @@ def register(app):
             "incidents": rows,
         }
 
+    # ═══════════════════════════════════════════════════════════════
+    # SESSION 1 AI endpoints — enrichment narrators
+    # ═══════════════════════════════════════════════════════════════
+
+    # ── Dashboard: morning briefing ──
+    @app.get("/api/ai/dashboard-briefing")
+    def ai_dash_briefing():
+        try:
+            from analyzers.llm_assistant import dashboard_briefing
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        # Today
+        today = conn.execute("SELECT date('now','localtime') as d").fetchone()["d"]
+        yest = conn.execute("SELECT date('now','-1 day','localtime') as d").fetchone()["d"]
+        def _stat(day, verdict=None, status=None):
+            q = "SELECT COUNT(*) as c FROM incidents WHERE date(created_at)=?"
+            p = [day]
+            if verdict:
+                q += " AND verdict=?"; p.append(verdict)
+            if status:
+                q += " AND status=?"; p.append(status)
+            return conn.execute(q, p).fetchone()["c"]
+        try:
+            today_alerts = conn.execute(
+                "SELECT COUNT(*) as c FROM ingested_alerts WHERE date(timestamp)=?", (today,)
+            ).fetchone()["c"]
+            yest_alerts = conn.execute(
+                "SELECT COUNT(*) as c FROM ingested_alerts WHERE date(timestamp)=?", (yest,)
+            ).fetchone()["c"]
+        except Exception:
+            today_alerts = yest_alerts = 0
+        # Gather all _stat calls BEFORE closing conn
+        today_open = _stat(today, status="open")
+        today_tp = _stat(today, verdict="true_positive", status="closed")
+        today_fp = _stat(today, verdict="false_positive", status="closed")
+        yest_tp = _stat(yest, verdict="true_positive", status="closed")
+        yest_fp = _stat(yest, verdict="false_positive", status="closed")
+        top_open = [dict(r) for r in conn.execute(
+            "SELECT title, severity FROM incidents WHERE status='open' "
+            "ORDER BY CASE severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 "
+            "WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END, created_at DESC LIMIT 5"
+        ).fetchall()]
+        top_sigs = [{"name": r["signature"], "count": r["c"]} for r in conn.execute(
+            "SELECT signature, COUNT(*) as c FROM ingested_alerts "
+            "WHERE date(timestamp)=? GROUP BY signature ORDER BY c DESC LIMIT 5",
+            (today,)
+        ).fetchall()]
+        conn.close()
+        stats = {
+            "today_alerts": today_alerts,
+            "today_incidents_open": today_open,
+            "today_incidents_closed_tp": today_tp,
+            "today_incidents_closed_fp": today_fp,
+            "yesterday_alerts": yest_alerts,
+            "yesterday_incidents_closed_tp": yest_tp,
+            "yesterday_incidents_closed_fp": yest_fp,
+            "top_open_incidents": top_open,
+            "top_signatures": top_sigs,
+        }
+        r = dashboard_briefing(stats)
+        if "error" in r: response.status = 503
+        r["_stats"] = stats
+        return r
+
+    # ── Dashboard: state-of-security summary ──
+    @app.get("/api/ai/state-of-security")
+    def ai_state_of_sec():
+        try:
+            from analyzers.llm_assistant import state_of_security
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        open_c = conn.execute("SELECT COUNT(*) as c FROM incidents WHERE status='open'").fetchone()["c"]
+        open_crit = conn.execute("SELECT COUNT(*) as c FROM incidents WHERE status='open' AND severity='critical'").fetchone()["c"]
+        recent_tp = conn.execute(
+            "SELECT COUNT(*) as c FROM incidents WHERE verdict='true_positive' "
+            "AND resolved_at > datetime('now','-1 day','localtime')"
+        ).fetchone()["c"]
+        try:
+            alerts_last_hr = conn.execute(
+                "SELECT COUNT(*) as c FROM ingested_alerts WHERE timestamp > datetime('now','-1 hour','localtime')"
+            ).fetchone()["c"]
+            # Baseline: alerts per hour, last 24h
+            total_24h = conn.execute(
+                "SELECT COUNT(*) as c FROM ingested_alerts WHERE timestamp > datetime('now','-1 day','localtime')"
+            ).fetchone()["c"]
+            baseline_hourly = total_24h // 24 if total_24h else 0
+        except Exception:
+            alerts_last_hr = baseline_hourly = 0
+        try:
+            active_blocks = conn.execute("SELECT COUNT(*) as c FROM blocklist WHERE active=1").fetchone()["c"]
+            active_qs = conn.execute("SELECT COUNT(*) as c FROM quarantine WHERE active=1").fetchone()["c"]
+        except Exception:
+            active_blocks = active_qs = 0
+        conn.close()
+        stats = {
+            "open_incidents": open_c, "open_critical": open_crit,
+            "sla_breached": 0,  # placeholder
+            "recent_tp": recent_tp,
+            "alerts_last_hour": alerts_last_hr,
+            "alerts_baseline_hourly": baseline_hourly,
+            "active_blocks": active_blocks, "active_quarantines": active_qs,
+        }
+        r = state_of_security(stats)
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Dashboard: anomaly narrator ──
+    @app.get("/api/ai/anomaly-narrator")
+    def ai_anomaly_narrator():
+        try:
+            from analyzers.llm_assistant import anomaly_narrator
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        try:
+            cur_alerts = conn.execute(
+                "SELECT COUNT(*) as c FROM ingested_alerts WHERE timestamp > datetime('now','-1 hour','localtime')"
+            ).fetchone()["c"]
+            baseline_alerts = conn.execute(
+                "SELECT COUNT(*) as c FROM ingested_alerts "
+                "WHERE timestamp > datetime('now','-8 hours','localtime') "
+                "AND timestamp < datetime('now','-1 hour','localtime')"
+            ).fetchone()["c"] // 7  # per-hour avg from previous 7 hours
+        except Exception:
+            cur_alerts = baseline_alerts = 0
+        cur_open = conn.execute("SELECT COUNT(*) as c FROM incidents WHERE status='open'").fetchone()["c"]
+        conn.close()
+        r = anomaly_narrator(
+            current_metrics={"alerts_per_hour": cur_alerts, "open_incidents": cur_open},
+            baseline_metrics={"alerts_per_hour": baseline_alerts, "open_incidents": max(cur_open // 2, 1)},
+        )
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Incident: similar-incidents narrative ──
+    @app.get("/api/incidents/<incident_id:int>/ai-similar")
+    def ai_similar(incident_id):
+        try:
+            from analyzers.llm_assistant import similar_incidents_narrative
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        cur = conn.execute("SELECT id, title, signature_id, signature FROM incidents WHERE id=?", (incident_id,)).fetchone()
+        if not cur:
+            conn.close(); response.status = 404; return {"error": "Incident not found"}
+        cur = dict(cur)
+        past = [dict(r) for r in conn.execute(
+            "SELECT id, verdict, closure_summary FROM incidents "
+            "WHERE signature_id=? AND status='closed' AND id != ? "
+            "ORDER BY resolved_at DESC LIMIT 10",
+            (cur["signature_id"], incident_id)
+        ).fetchall()]
+        conn.close()
+        r = similar_incidents_narrative(cur, past)
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Incident: playbook recommendation ──
+    @app.get("/api/incidents/<incident_id:int>/ai-playbook")
+    def ai_playbook(incident_id):
+        try:
+            from analyzers.llm_assistant import playbook_recommendation
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        inc = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+        if not inc:
+            conn.close(); response.status = 404; return {"error": "Incident not found"}
+        inc = dict(inc)
+        # Dest asset info if registered
+        dst_asset = None
+        if inc.get("victim_ip"):
+            row = conn.execute("SELECT owner, asset_type, business_critical FROM assets WHERE ip=?",
+                               (inc["victim_ip"],)).fetchone()
+            dst_asset = dict(row) if row else None
+        conn.close()
+        src = inc.get("attacker_ip", "") or ""
+        ctx = {
+            "signature": inc.get("signature", ""),
+            "severity": inc.get("severity", ""),
+            "src_ip": src,
+            "source_is_external": not (src.startswith("10.") or src.startswith("172.16.") or src.startswith("192.168.")),
+            "dst_ip": inc.get("victim_ip", ""),
+            "dst_asset": dst_asset,
+        }
+        r = playbook_recommendation(ctx)
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Incident: attack-chain narrative ──
+    @app.get("/api/incidents/<incident_id:int>/ai-chain")
+    def ai_chain(incident_id):
+        try:
+            from analyzers.llm_assistant import attack_chain_narrative
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        events = [dict(r) for r in conn.execute(
+            "SELECT src_ip, dest_ip, timestamp, event_summary, sid FROM incident_events "
+            "WHERE incident_id=? ORDER BY timestamp LIMIT 40",
+            (incident_id,)
+        ).fetchall()]
+        conn.close()
+        if not events:
+            return {"error": "No events to narrate for this incident"}
+        r = attack_chain_narrative(events)
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Investigate: IP profile ──
+    @app.get("/api/ai/profile-ip/<ip>")
+    def ai_profile_ip(ip):
+        try:
+            from analyzers.llm_assistant import profile_ip
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        is_internal = ip.startswith("10.") or ip.startswith("172.16.") or ip.startswith("192.168.")
+        asset = conn.execute(
+            "SELECT owner, hostname, asset_type, purdue_level, business_critical "
+            "FROM assets WHERE ip=?", (ip,)
+        ).fetchone()
+        # From ingested_alerts, compute top dest ports for outbound + top peers
+        top_dest_ports = [(r["p"], r["c"]) for r in conn.execute(
+            "SELECT dest_port as p, COUNT(*) as c FROM ingested_alerts "
+            "WHERE src_ip=? AND dest_port IS NOT NULL AND dest_port > 0 "
+            "GROUP BY dest_port ORDER BY c DESC LIMIT 8",
+            (ip,)
+        ).fetchall()]
+        top_dest_ips = [(r["d"], r["c"]) for r in conn.execute(
+            "SELECT dest_ip as d, COUNT(*) as c FROM ingested_alerts "
+            "WHERE src_ip=? GROUP BY dest_ip ORDER BY c DESC LIMIT 5",
+            (ip,)
+        ).fetchall()]
+        top_sigs = [(r["s"], r["c"]) for r in conn.execute(
+            "SELECT signature as s, COUNT(*) as c FROM ingested_alerts "
+            "WHERE src_ip=? OR dest_ip=? GROUP BY signature ORDER BY c DESC LIMIT 5",
+            (ip, ip)
+        ).fetchall()]
+        total_flows = conn.execute(
+            "SELECT COUNT(*) as c FROM ingested_alerts WHERE src_ip=? OR dest_ip=?", (ip, ip)
+        ).fetchone()["c"]
+        # Reputation
+        rep = conn.execute("SELECT abuse_score FROM ip_reputation WHERE ip=?", (ip,)).fetchone()
+        conn.close()
+        ctx = {
+            "is_internal": is_internal,
+            "asset_info": dict(asset) if asset else None,
+            "top_dest_ports": top_dest_ports,
+            "top_dest_ips": top_dest_ips,
+            "top_signatures": top_sigs,
+            "total_flows": total_flows,
+            "abuse_score": rep["abuse_score"] if rep else None,
+        }
+        r = profile_ip(ip, ctx)
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Assets: profile + auto-classify ──
+    @app.get("/api/ai/profile-asset/<ip>")
+    def ai_profile_asset(ip):
+        try:
+            from analyzers.llm_assistant import profile_asset
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        asset = conn.execute("SELECT * FROM assets WHERE ip=?", (ip,)).fetchone()
+        top_dest_ports = [(r["p"], r["c"]) for r in conn.execute(
+            "SELECT dest_port as p, COUNT(*) as c FROM ingested_alerts "
+            "WHERE src_ip=? AND dest_port IS NOT NULL GROUP BY dest_port ORDER BY c DESC LIMIT 8",
+            (ip,)
+        ).fetchall()]
+        top_peers = [(r["d"], r["c"]) for r in conn.execute(
+            "SELECT dest_ip as d, COUNT(*) as c FROM ingested_alerts "
+            "WHERE src_ip=? GROUP BY dest_ip ORDER BY c DESC LIMIT 5",
+            (ip,)
+        ).fetchall()]
+        total_flows = conn.execute(
+            "SELECT COUNT(*) as c FROM ingested_alerts WHERE src_ip=? OR dest_ip=?", (ip, ip)
+        ).fetchone()["c"]
+        conn.close()
+        ctx = {
+            "asset_info": dict(asset) if asset else {},
+            "top_dest_ports": top_dest_ports,
+            "top_peers": top_peers,
+            "total_flows": total_flows,
+        }
+        r = profile_asset(ip, ctx)
+        if "error" in r: response.status = 503
+        return r
+
+    @app.get("/api/ai/classify-asset/<ip>")
+    def ai_classify_asset(ip):
+        try:
+            from analyzers.llm_assistant import auto_classify_asset
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        conn = get_db()
+        top_dest_ports = [(r["p"], r["c"]) for r in conn.execute(
+            "SELECT dest_port as p, COUNT(*) as c FROM ingested_alerts "
+            "WHERE src_ip=? AND dest_port IS NOT NULL GROUP BY dest_port ORDER BY c DESC LIMIT 10",
+            (ip,)
+        ).fetchall()]
+        # Listening ports = ports where THIS IP is dest and it's TCP
+        listening = [r["p"] for r in conn.execute(
+            "SELECT DISTINCT dest_port as p FROM ingested_alerts "
+            "WHERE dest_ip=? AND dest_port IS NOT NULL AND proto='TCP' "
+            "GROUP BY dest_port ORDER BY COUNT(*) DESC LIMIT 8",
+            (ip,)
+        ).fetchall()]
+        total = conn.execute(
+            "SELECT COUNT(*) as c FROM ingested_alerts WHERE src_ip=? OR dest_ip=?", (ip, ip)
+        ).fetchone()["c"]
+        conn.close()
+        ctx = {
+            "listening_ports": listening,
+            "top_dest_ports": top_dest_ports,
+            "total_flows": total,
+        }
+        r = auto_classify_asset(ip, ctx)
+        if "error" in r: response.status = 503
+        return r
+
+    # ── Threat Intel: IOC narrative ──
+    @app.post("/api/ai/ioc-narrative")
+    def ai_ioc_narrative():
+        try:
+            from analyzers.llm_assistant import ioc_narrative
+        except Exception as e:
+            response.status = 503; return {"error": f"LLM unavailable: {e}"}
+        data = request.json or {}
+        ind_type = data.get("type", "ip")
+        value = (data.get("value") or "").strip()
+        if not value:
+            response.status = 400; return {"error": "value required"}
+        # Assemble enrichment from cached TI + local history
+        conn = get_db()
+        enrichment = {}
+        if ind_type == "ip":
+            rep = conn.execute("SELECT * FROM ip_reputation WHERE ip=?", (value,)).fetchone()
+            if rep:
+                r = dict(rep)
+                enrichment["abuseipdb"] = {
+                    "abuse_score": r.get("abuse_score", 0),
+                    "total_reports": r.get("total_reports", 0),
+                    "country_code": r.get("country_code", ""),
+                }
+            geo = conn.execute("SELECT * FROM geo_cache WHERE ip=?", (value,)).fetchone()
+            if geo:
+                g = dict(geo)
+                enrichment["geoip"] = {"country": g.get("country", ""), "isp": g.get("isp", ""), "org": g.get("org", "")}
+            # Local history
+            row = conn.execute(
+                "SELECT COUNT(*) as fc, COUNT(DISTINCT src_ip)+COUNT(DISTINCT dest_ip) as pc FROM ingested_alerts WHERE src_ip=? OR dest_ip=?",
+                (value, value)
+            ).fetchone()
+            if row:
+                enrichment["local_history"] = {
+                    "flow_count": row["fc"], "distinct_peers": row["pc"],
+                    "alert_count": row["fc"],
+                }
+        conn.close()
+        r = ioc_narrative(ind_type, value, enrichment)
+        if "error" in r: response.status = 503
+        return r
+
     @app.get("/api/incidents/<incident_id:int>/related-history")
     def related_history(incident_id):
         conn = get_db()

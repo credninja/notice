@@ -522,3 +522,341 @@ def health():
         }
     except Exception as e:
         return {"ok": False, "error": str(e), "host": OLLAMA_HOST}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SESSION 1 additions — enrichment narrators
+# All follow the same pattern: gather context → prompt LLM → return dict
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Dashboard briefing (morning brief + state-of-security) ──
+_DASH_BRIEFING_SYSTEM = """You are a senior SOC lead producing a morning brief for analysts starting their shift.
+Given yesterday's + today's activity, respond in JSON:
+{
+  "headline": "one-line bottom line for the analyst starting their shift",
+  "yesterday": "1-2 sentences on what happened yesterday",
+  "today_so_far": "1-2 sentences on today's activity so far",
+  "focus_areas": ["short bullet 1", "short bullet 2", "short bullet 3"]
+}
+Be factual. Only cite numbers from the input. Keep it short — this is scanned in seconds."""
+
+
+def dashboard_briefing(stats):
+    """stats: {today_alerts, today_incidents_open, today_incidents_closed_tp,
+    today_incidents_closed_fp, yesterday_alerts, yesterday_incidents_closed_tp,
+    yesterday_incidents_closed_fp, top_open_incidents:[{title,severity}], top_signatures:[{name,count}]}"""
+    if not stats:
+        return {"error": "stats required"}
+    lines = []
+    lines.append(f"TODAY: {stats.get('today_alerts', 0)} alerts, "
+                 f"{stats.get('today_incidents_open', 0)} open incidents, "
+                 f"{stats.get('today_incidents_closed_tp', 0)} closed TP, "
+                 f"{stats.get('today_incidents_closed_fp', 0)} closed FP")
+    lines.append(f"YESTERDAY: {stats.get('yesterday_alerts', 0)} alerts, "
+                 f"{stats.get('yesterday_incidents_closed_tp', 0)} closed TP, "
+                 f"{stats.get('yesterday_incidents_closed_fp', 0)} closed FP")
+    if stats.get("top_open_incidents"):
+        lines.append("Top open incidents:")
+        for i in stats["top_open_incidents"][:5]:
+            lines.append(f"  - [{i.get('severity', '?')}] {i.get('title', '')[:100]}")
+    if stats.get("top_signatures"):
+        lines.append("Top signatures today:")
+        for s in stats["top_signatures"][:5]:
+            lines.append(f"  - {s.get('name', '')[:80]} ({s.get('count', 0)})")
+    prompt = "\n".join(lines) + "\n\nWrite the morning brief as JSON per the schema."
+    r = _call_ollama(prompt, system_prompt=_DASH_BRIEFING_SYSTEM, num_predict=350)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+_STATE_OF_SEC_SYSTEM = """You produce a one-paragraph plain-English 'state of security' for a SOC dashboard.
+Given aggregate stats, respond in JSON:
+{
+  "assessment": "traffic_light — 'green' | 'yellow' | 'red'",
+  "summary": "1-2 sentence health check for a manager",
+  "reasoning": "one sentence citing the specific numbers that drove your assessment"
+}
+Traffic light rules:
+  green  = alert volume normal, no TP incidents, no critical open incidents
+  yellow = alert volume elevated OR 1-2 TPs OR high-severity backlog
+  red    = major TP incidents active, or attack indicators present, or FP suppression not keeping up"""
+
+
+def state_of_security(stats):
+    lines = []
+    lines.append(f"Total open incidents: {stats.get('open_incidents', 0)}")
+    lines.append(f"  - critical: {stats.get('open_critical', 0)}")
+    lines.append(f"  - SLA breached: {stats.get('sla_breached', 0)}")
+    lines.append(f"TP incidents last 24h: {stats.get('recent_tp', 0)}")
+    lines.append(f"Alerts (last hour): {stats.get('alerts_last_hour', 0)}")
+    lines.append(f"Alerts (24h avg baseline): {stats.get('alerts_baseline_hourly', 0)}")
+    lines.append(f"Active blocks: {stats.get('active_blocks', 0)}, quarantines: {stats.get('active_quarantines', 0)}")
+    prompt = "\n".join(lines) + "\n\nProduce the state-of-security JSON."
+    r = _call_ollama(prompt, system_prompt=_STATE_OF_SEC_SYSTEM, num_predict=250)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+_ANOMALY_SYSTEM = """You explain why current SOC metrics are unusual compared to baseline.
+Given current + baseline numbers, respond in JSON:
+{
+  "is_anomalous": true | false,
+  "explanation": "2-3 sentences on what's unusual and the most likely cause",
+  "suggested_action": "one sentence — investigate, monitor, or dismiss"
+}
+Only mark is_anomalous=true if a metric is >2x its baseline or >3 standard deviations off."""
+
+
+def anomaly_narrator(current_metrics, baseline_metrics):
+    lines = ["Current vs baseline metrics:"]
+    for k in sorted(set(list(current_metrics.keys()) + list(baseline_metrics.keys()))):
+        cv = current_metrics.get(k, 0)
+        bv = baseline_metrics.get(k, 0)
+        ratio = (cv / bv) if bv else float("inf") if cv else 1
+        lines.append(f"  {k}: current={cv}, baseline={bv} ({ratio:.1f}x)")
+    prompt = "\n".join(lines) + "\n\nRespond in JSON per the schema."
+    r = _call_ollama(prompt, system_prompt=_ANOMALY_SYSTEM, num_predict=250)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── IP profile summary (Investigate page) ──
+_IP_PROFILE_SYSTEM = """You produce an IP profile summary for a SOC analyst investigating an unknown IP.
+Given the IP's activity data, respond in JSON:
+{
+  "attribution": "one-line best guess: 'developer workstation' / 'file server' / 'IoT camera' / 'known scanner' / 'external attacker' / 'CDN edge' / 'unknown'",
+  "confidence": "low" | "medium" | "high",
+  "profile": "2-3 sentence plain-English profile — activity patterns, services used, notable behaviors",
+  "notable_indicators": ["short bullet 1", "short bullet 2", "short bullet 3"],
+  "investigate_next": "one concrete next step for the analyst"
+}
+Base attribution on:
+- If asset is registered with an owner/type, use that
+- Volume of connections (heavy volume = server, low = client)
+- Ports it connects TO (443/80 = web browsing, 53 = DNS, weird high ports = scanner or C2)
+- Ports it listens ON (22 = SSH server, 445 = SMB server, none = client)
+- Geographic pattern of external destinations
+- Presence in threat intel (VT/AbuseIPDB scores)"""
+
+
+def profile_ip(ip, ctx):
+    """ctx: {is_internal, asset_info, top_dest_ports:[(port,count)], top_dest_ips:[(ip,count)],
+    listening_ports:[...], countries_hit:[...], vt_score, abuse_score, tls_ja3s:[...],
+    total_flows, active_days, top_signatures:[...]}"""
+    lines = [f"IP: {ip} ({'INTERNAL' if ctx.get('is_internal') else 'EXTERNAL'})"]
+    a = ctx.get("asset_info")
+    if a:
+        lines.append(f"Registered asset: owner={a.get('owner', '?')}, type={a.get('asset_type', '?')}, "
+                     f"purdue_level={a.get('purdue_level', '?')}, critical={bool(a.get('business_critical'))}")
+    lines.append(f"Total flows observed: {ctx.get('total_flows', 0)} over {ctx.get('active_days', '?')} days")
+    if ctx.get("top_dest_ports"):
+        lines.append("Top destination ports: " + ", ".join(f"{p}({c})" for p, c in ctx["top_dest_ports"][:8]))
+    if ctx.get("top_dest_ips"):
+        lines.append("Top destination IPs: " + ", ".join(f"{d}({c})" for d, c in ctx["top_dest_ips"][:5]))
+    if ctx.get("listening_ports"):
+        lines.append("Listening ports (server behaviour): " + ", ".join(str(p) for p in ctx["listening_ports"][:8]))
+    if ctx.get("countries_hit"):
+        lines.append("Countries connected to: " + ", ".join(ctx["countries_hit"][:8]))
+    if ctx.get("vt_score") is not None:
+        lines.append(f"VirusTotal score: {ctx['vt_score']}/100")
+    if ctx.get("abuse_score") is not None:
+        lines.append(f"AbuseIPDB abuse score: {ctx['abuse_score']}/100")
+    if ctx.get("top_signatures"):
+        lines.append("Alerts involving this IP: " + ", ".join(f"{s[0][:40]} x{s[1]}" for s in ctx["top_signatures"][:5]))
+    prompt = "\n".join(lines) + "\n\nProduce the profile JSON."
+    r = _call_ollama(prompt, system_prompt=_IP_PROFILE_SYSTEM, num_predict=400)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Asset profile summary / behavior change / auto-classify ──
+_ASSET_PROFILE_SYSTEM = """You describe a network asset's normal behavior for a SOC analyst.
+Given the asset's activity data, respond in JSON:
+{
+  "role_summary": "one-line role guess (e.g., 'internal DNS + AD server', 'analyst workstation', 'IP camera')",
+  "normal_behavior": "2-3 sentences on typical daily patterns — services, peers, volume",
+  "recent_changes": "one sentence — has behavior shifted recently? If nothing changed, say 'behavior consistent'",
+  "watch_for": "one sentence — what would be anomalous for this specific asset"
+}
+Be specific to THIS asset's actual data. Don't give generic advice."""
+
+
+def profile_asset(ip, ctx):
+    """ctx: same shape as profile_ip, plus recent_change_signals if available"""
+    lines = [f"Asset: {ip}"]
+    a = ctx.get("asset_info") or {}
+    if a:
+        lines.append(f"Registered: owner={a.get('owner', '?')}, type={a.get('asset_type', '?')}")
+    lines.append(f"Total flows: {ctx.get('total_flows', 0)}")
+    if ctx.get("listening_ports"):
+        lines.append("Listening on: " + ", ".join(str(p) for p in ctx["listening_ports"][:10]))
+    if ctx.get("top_dest_ports"):
+        lines.append("Outbound to: " + ", ".join(f":{p}({c})" for p, c in ctx["top_dest_ports"][:8]))
+    if ctx.get("top_peers"):
+        lines.append("Talks to: " + ", ".join(f"{d}({c})" for d, c in ctx["top_peers"][:5]))
+    if ctx.get("recent_change_signals"):
+        lines.append("Recent change signals: " + str(ctx["recent_change_signals"]))
+    if ctx.get("services_detected"):
+        lines.append("Detected services: " + ", ".join(ctx["services_detected"]))
+    prompt = "\n".join(lines) + "\n\nProduce the asset profile JSON."
+    r = _call_ollama(prompt, system_prompt=_ASSET_PROFILE_SYSTEM, num_predict=350)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+_ASSET_CLASSIFY_SYSTEM = """Given an asset's traffic pattern, guess what kind of device it is.
+Respond in JSON:
+{
+  "asset_type": "workstation | server | iot | network_device | scanner | mobile | unknown",
+  "specific_role": "more specific guess (e.g., 'linux dev workstation', 'wazuh manager', 'IP camera', 'network printer')",
+  "confidence": "low | medium | high",
+  "reasoning": "1-2 sentences citing which traffic characteristics led to this classification"
+}"""
+
+
+def auto_classify_asset(ip, ctx):
+    lines = [f"Asset IP: {ip}"]
+    if ctx.get("listening_ports"):
+        lines.append(f"Listening ports: {ctx['listening_ports']}")
+    if ctx.get("top_dest_ports"):
+        lines.append(f"Outbound ports: {[p for p,_ in ctx['top_dest_ports'][:10]]}")
+    lines.append(f"Total flows: {ctx.get('total_flows', 0)}")
+    if ctx.get("mac_vendor"):
+        lines.append(f"MAC vendor: {ctx['mac_vendor']}")
+    if ctx.get("tls_ja3s"):
+        lines.append(f"TLS JA3 fingerprints: {ctx['tls_ja3s'][:3]}")
+    if ctx.get("user_agents"):
+        lines.append(f"HTTP User-Agents: {ctx['user_agents'][:3]}")
+    prompt = "\n".join(lines) + "\n\nClassify as JSON."
+    r = _call_ollama(prompt, system_prompt=_ASSET_CLASSIFY_SYSTEM, num_predict=250)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── IOC narrative (Threat Intel page) ──
+_IOC_NARRATIVE_SYSTEM = """You produce a threat-intel narrative for an IOC (IP / domain / URL / hash).
+Given enrichment data, respond in JSON:
+{
+  "verdict": "malicious | suspicious | benign | unknown",
+  "narrative": "2-3 sentences telling the story — what this IOC is, why it matters, what threat intel says",
+  "risk_score": <integer 0-100>,
+  "recommended_action": "one concrete action: 'block', 'watchlist', 'monitor', 'dismiss'",
+  "reasoning": "one sentence — why this verdict/action given the evidence"
+}
+Only mark 'malicious' if VT engines >5 flag it, or AbuseIPDB score >75, or on TI feeds.
+Mark 'benign' if it's a well-known CDN/cloud provider with clean TI."""
+
+
+def ioc_narrative(indicator_type, value, enrichment):
+    lines = [f"IOC type: {indicator_type}", f"Value: {value}"]
+    if enrichment.get("vt"):
+        vt = enrichment["vt"]
+        lines.append(f"VirusTotal: {vt.get('malicious_engines', 0)}/{vt.get('total_engines', 0)} engines flag it "
+                     f"(categories: {vt.get('categories', [])[:5]})")
+    if enrichment.get("abuseipdb"):
+        ab = enrichment["abuseipdb"]
+        lines.append(f"AbuseIPDB: score={ab.get('abuse_score', 0)}, reports={ab.get('total_reports', 0)}, "
+                     f"country={ab.get('country_code', '?')}")
+    if enrichment.get("geoip"):
+        g = enrichment["geoip"]
+        lines.append(f"Geo: {g.get('country', '?')}, ISP={g.get('isp', '?')}, org={g.get('org', '?')}")
+    if enrichment.get("local_history"):
+        lh = enrichment["local_history"]
+        lines.append(f"Local history: seen {lh.get('flow_count', 0)} times, "
+                     f"peers {lh.get('distinct_peers', 0)}, "
+                     f"associated with {lh.get('alert_count', 0)} alerts")
+    if enrichment.get("ti_feeds"):
+        lines.append(f"On threat feeds: {enrichment['ti_feeds']}")
+    prompt = "\n".join(lines) + "\n\nProduce the IOC narrative JSON."
+    r = _call_ollama(prompt, system_prompt=_IOC_NARRATIVE_SYSTEM, num_predict=350)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+# ── Incident similar-finder + playbook + attack chain ──
+_SIMILAR_INC_SYSTEM = """Given a current incident and a list of past closed incidents with the same signature,
+explain the pattern in JSON:
+{
+  "pattern_summary": "one sentence describing the recurring pattern",
+  "typical_verdict": "how these historically resolve (TP or FP)",
+  "recommendation": "one sentence recommendation for the current incident based on history"
+}"""
+
+
+def similar_incidents_narrative(current_incident, past_incidents):
+    lines = [f"Current incident: {current_incident.get('title', '')} (SID {current_incident.get('signature_id', '?')})"]
+    lines.append(f"Historic closures for same SID: {len(past_incidents)}")
+    if past_incidents:
+        tp = sum(1 for i in past_incidents if i.get("verdict") == "true_positive")
+        fp = sum(1 for i in past_incidents if i.get("verdict") == "false_positive")
+        lines.append(f"  TP: {tp}, FP: {fp}")
+        # Sample the closure summaries
+        summaries = [i.get("closure_summary", "")[:120] for i in past_incidents[:3] if i.get("closure_summary")]
+        if summaries:
+            lines.append("Sample past closure summaries:")
+            for s in summaries:
+                lines.append(f"  - {s}")
+    prompt = "\n".join(lines) + "\n\nProduce the pattern JSON."
+    r = _call_ollama(prompt, system_prompt=_SIMILAR_INC_SYSTEM, num_predict=250)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+_PLAYBOOK_SYSTEM = """You recommend a response playbook for an incident.
+Given incident context, respond in JSON:
+{
+  "playbook_name": "short name for the incident type (e.g., 'SSH Brute Force Response', 'Web Application Attack')",
+  "steps": ["step 1 (be concrete: 'block source IP in firewall', 'reset user password', etc.)", "step 2", "step 3", "step 4", "step 5"],
+  "priority": "immediate | within_1hr | within_24hr | routine",
+  "notes": "1 sentence caveat or context"
+}
+Base playbook on the signature category (brute force, exploit, C2, exfil, recon, policy)."""
+
+
+def playbook_recommendation(incident_context):
+    lines = [f"Signature: {incident_context.get('signature', '')}",
+             f"Severity: {incident_context.get('severity', '')}",
+             f"Source: {incident_context.get('src_ip', '')} ({'external' if incident_context.get('source_is_external') else 'internal'})",
+             f"Destination: {incident_context.get('dst_ip', '')}"]
+    if incident_context.get("dst_asset"):
+        lines.append(f"  Destination asset: {incident_context['dst_asset']}")
+    if incident_context.get("kill_chain_phase"):
+        lines.append(f"Kill-chain phase: {incident_context['kill_chain_phase']}")
+    prompt = "\n".join(lines) + "\n\nProduce the playbook JSON."
+    r = _call_ollama(prompt, system_prompt=_PLAYBOOK_SYSTEM, num_predict=400)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r
+
+
+_ATTACK_CHAIN_SYSTEM = """You narrate a multi-event security incident as a chronological story.
+Given events sorted by time, respond in JSON:
+{
+  "story": "3-5 sentence narrative of what happened in chronological order",
+  "phases_observed": ["Reconnaissance", "Exploitation", "..."],
+  "attacker_progression": "one sentence on how far the attacker got"
+}
+Keep the story factual — cite specific timestamps and SIDs from the events."""
+
+
+def attack_chain_narrative(events):
+    if not events:
+        return {"error": "No events to narrate"}
+    lines = [f"Total events: {len(events)}", "Timeline:"]
+    for ev in events[:20]:  # cap at 20 to keep prompt short
+        lines.append(f"  {ev.get('timestamp', '')[:19]}  [{ev.get('sid', '?')}] "
+                     f"{ev.get('src_ip', '')} -> {ev.get('dest_ip', '')}  "
+                     f"{(ev.get('event_summary', '') or '')[:80]}")
+    prompt = "\n".join(lines) + "\n\nProduce the attack-chain narrative JSON."
+    r = _call_ollama(prompt, system_prompt=_ATTACK_CHAIN_SYSTEM, num_predict=400)
+    if "error" not in r:
+        r["_model"] = OLLAMA_MODEL
+    return r

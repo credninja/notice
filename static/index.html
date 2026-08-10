@@ -960,6 +960,7 @@ async function loadAssets_inner(ct){
       <td>${esc(a.os||'-')}</td>
       <td class="truncate" style="max-width:160px;" title="${esc(a.notes||'')}">${esc(a.notes||'')}</td>
       <td style="white-space:nowrap;">
+        <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiAssetModal('${esc(a.ip)}','${esc(a.owner||'')}')" title="AI profile + classify">🧠 AI</button>
         <button class="btn btn-sm" onclick="toggleCritical(${a.id},${a.business_critical?0:1})" title="${a.business_critical?'Remove business-critical flag':'Mark as business-critical'}">${a.business_critical?'★ Unmark':'☆ Critical'}</button>
         <button class="btn btn-sm" onclick="editAsset(${a.id})">Edit</button>
         <button class="btn btn-sm btn-danger" onclick="deleteAsset(${a.id})">Del</button>
@@ -1064,6 +1065,31 @@ async function loadDashboard(){
   const rateColor=alertRate>5?'var(--critical)':alertRate>2?'var(--alert)':alertRate>1?'var(--warn)':'var(--success)';
 
   let h='';
+
+  // AI Dashboard row (Morning briefing + State-of-security + Anomaly narrator)
+  h+=`<div id="aiDashRow" style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px;margin-bottom:12px;">
+    <div class="detail-panel" style="padding:12px;border-left:3px solid #8b5cf6;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;font-weight:700;">🧠 Morning Briefing</div>
+        <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiDashBriefing(this)">Generate</button>
+      </div>
+      <div id="aiDashBriefingBody" style="font-size:11px;color:var(--text-dim);font-style:italic;">Click Generate for today's SOC brief.</div>
+    </div>
+    <div class="detail-panel" style="padding:12px;border-left:3px solid #10b981;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;font-weight:700;">🧠 Security Health</div>
+        <button class="btn btn-sm" style="background:#10b981;color:#fff;border:none;" onclick="_aiStateOfSec(this)">Check</button>
+      </div>
+      <div id="aiStateOfSecBody" style="font-size:11px;color:var(--text-dim);font-style:italic;">Click Check for state-of-security.</div>
+    </div>
+    <div class="detail-panel" style="padding:12px;border-left:3px solid #f59e0b;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;font-weight:700;">🧠 Anomaly Radar</div>
+        <button class="btn btn-sm" style="background:#f59e0b;color:#fff;border:none;" onclick="_aiAnomalyNarrator(this)">Scan</button>
+      </div>
+      <div id="aiAnomalyBody" style="font-size:11px;color:var(--text-dim);font-style:italic;">Click Scan to check for anomalies.</div>
+    </div>
+  </div>`;
 
   h+=`<div class="sub-tabs" style="margin-bottom:6px;">
     <button class="sub-tab active" onclick="showDashTab('overview',this)">Overview</button>
@@ -2911,8 +2937,12 @@ async function doInvestigate(ip){
   let h=`<div class="detail-panel"><div style="display:flex;justify-content:space-between;align-items:center;">
     <div><span style="font-size:18px;font-weight:700;color:var(--accent)">${d.ip}</span>
     <span class="tag ${d.internal?'int':'ext'}">${d.internal?'Internal':'External'}</span>${ownerInfo}${hostInfo}${svcInfo}${geoInfo}</div>
-    <button class="btn btn-sm" onclick="createIncidentFromIP('${d.ip}')">Create Incident</button></div>
-    <div style="font-size:11px;color:var(--text-dim);margin-top:6px;">First seen: ${fmtDateTime(d.first_seen)} | Last seen: ${fmtDateTime(d.last_seen)} | Services: ${(d.services||[]).join(', ')||'none'} | Connections: ${d.total_connections}${d.isp?' | ISP: '+esc(d.isp):''}</div></div>`;
+    <div style="display:flex;gap:6px;">
+      <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiProfileIp('${esc(d.ip)}',this)">🧠 AI Profile</button>
+      <button class="btn btn-sm" onclick="createIncidentFromIP('${d.ip}')">Create Incident</button>
+    </div></div>
+    <div style="font-size:11px;color:var(--text-dim);margin-top:6px;">First seen: ${fmtDateTime(d.first_seen)} | Last seen: ${fmtDateTime(d.last_seen)} | Services: ${(d.services||[]).join(', ')||'none'} | Connections: ${d.total_connections}${d.isp?' | ISP: '+esc(d.isp):''}</div>
+    <div id="aiIpProfileBody" style="margin-top:10px;"></div></div>`;
   if(d.risk_indicators&&d.risk_indicators.length){
     h+='<div class="section-hdr">Risk Indicators</div><div class="risk-list">';
     d.risk_indicators.forEach(r=>{h+=`<div class="risk-item ${r.severity}">${esc(r.message)}</div>`;});
@@ -4061,16 +4091,24 @@ async function showIncidentDetail(id){
     }catch(e){console.error('Failed to load assignees:',e);}
   },0);
 
-  // AI triage assistant panel — analyst clicks button, local LLM writes a verdict recommendation
+  // AI panels — triage + similar + playbook + chain
   h+=`<div class="detail-panel" style="padding:10px;margin-bottom:10px;border-left:3px solid #8b5cf6;">
-    <div style="display:flex;justify-content:space-between;align-items:center;">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
       <div>
-        <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;font-weight:700;">🧠 AI Triage Assistant</div>
-        <div style="font-size:10px;color:var(--text-dim);margin-top:2px;">Runs a local LLM on incident context — nothing leaves your server.</div>
+        <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;font-weight:700;">🧠 AI Assistants</div>
+        <div style="font-size:10px;color:var(--text-dim);margin-top:2px;">All queries run on your local LLM — nothing leaves the server.</div>
       </div>
-      <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiAnalyze(${d.id},this)">Analyze Incident</button>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiAnalyze(${d.id},this)">Analyze</button>
+        <button class="btn btn-sm" style="background:#6366f1;color:#fff;border:none;" onclick="_aiSimilarInc(${d.id},this)">Similar History</button>
+        <button class="btn btn-sm" style="background:#10b981;color:#fff;border:none;" onclick="_aiPlaybook(${d.id},this)">Playbook</button>
+        <button class="btn btn-sm" style="background:#f59e0b;color:#fff;border:none;" onclick="_aiChain(${d.id},this)">Attack Chain</button>
+      </div>
     </div>
     <div id="aiAnalysisBody" style="margin-top:8px;"></div>
+    <div id="aiSimilarBody" style="margin-top:8px;"></div>
+    <div id="aiPlaybookBody" style="margin-top:8px;"></div>
+    <div id="aiChainBody" style="margin-top:8px;"></div>
   </div>`;
 
   // Related history panel — helps triage by showing prior verdicts for this signature
@@ -5097,6 +5135,176 @@ async function markIncidentInvestigating(id){
 
 // Reopen a closed incident — status goes back to open, verdict cleared.
 // AI triage — POSTs to /api/incidents/<id>/ai-analysis, renders verdict inline
+// ═════════ Session 1 incident + IP + asset AI helpers ═════════
+async function _aiSimilarInc(id, btn){
+  const body=document.getElementById('aiSimilarBody');
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Thinking…';
+  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);">Looking at history…</div>';
+  try{
+    const r=await api('/api/incidents/'+id+'/ai-similar');
+    if(r && !r.error){
+      body.innerHTML=`<div style="padding:8px 12px;background:rgba(99,102,241,.08);border-left:3px solid #6366f1;border-radius:6px;font-size:11px;">
+        <div style="margin-bottom:4px;"><strong>Pattern:</strong> ${esc(r.pattern_summary||'')}</div>
+        <div style="margin-bottom:4px;"><strong>Historically:</strong> ${esc(r.typical_verdict||'')}</div>
+        <div><strong>Recommendation:</strong> ${esc(r.recommendation||'')}</div>
+      </div>`;
+    } else {
+      body.innerHTML=`<div style="color:var(--critical);font-size:11px;">AI unavailable: ${esc(r?.error||'unknown')}</div>`;
+    }
+  } finally { btn.disabled=false; btn.textContent=orig; }
+}
+async function _aiPlaybook(id, btn){
+  const body=document.getElementById('aiPlaybookBody');
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Thinking…';
+  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);">Drafting playbook…</div>';
+  try{
+    const r=await api('/api/incidents/'+id+'/ai-playbook');
+    if(r && !r.error){
+      const steps=(r.steps||[]).map((s,i)=>`<li style="margin:3px 0;font-size:11px;"><strong>${i+1}.</strong> ${esc(s)}</li>`).join('');
+      body.innerHTML=`<div style="padding:8px 12px;background:rgba(16,185,129,.08);border-left:3px solid #10b981;border-radius:6px;font-size:11px;">
+        <div style="margin-bottom:6px;"><strong>${esc(r.playbook_name||'Response Playbook')}</strong> <span style="font-size:9px;color:#10b981;text-transform:uppercase;letter-spacing:.5px;margin-left:6px;">${esc(r.priority||'')}</span></div>
+        <ol style="margin:0;padding-left:20px;">${steps}</ol>
+        ${r.notes?`<div style="font-size:10px;color:var(--text-dim);margin-top:6px;font-style:italic;">${esc(r.notes)}</div>`:''}
+      </div>`;
+    } else {
+      body.innerHTML=`<div style="color:var(--critical);font-size:11px;">${esc(r?.error||'unknown')}</div>`;
+    }
+  } finally { btn.disabled=false; btn.textContent=orig; }
+}
+async function _aiChain(id, btn){
+  const body=document.getElementById('aiChainBody');
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Thinking…';
+  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);">Reconstructing timeline…</div>';
+  try{
+    const r=await api('/api/incidents/'+id+'/ai-chain');
+    if(r && !r.error){
+      const phases=(r.phases_observed||[]).map(p=>`<span style="display:inline-block;background:rgba(245,158,11,.15);color:#f59e0b;padding:2px 8px;border-radius:10px;font-size:10px;margin:2px;">${esc(p)}</span>`).join('');
+      body.innerHTML=`<div style="padding:8px 12px;background:rgba(245,158,11,.08);border-left:3px solid #f59e0b;border-radius:6px;font-size:11px;">
+        <div style="margin-bottom:6px;">${esc(r.story||'')}</div>
+        ${phases?`<div style="margin-bottom:6px;">${phases}</div>`:''}
+        <div style="font-size:10px;color:var(--text-dim);"><strong>Progression:</strong> ${esc(r.attacker_progression||'')}</div>
+      </div>`;
+    } else {
+      body.innerHTML=`<div style="color:var(--critical);font-size:11px;">${esc(r?.error||'unknown')}</div>`;
+    }
+  } finally { btn.disabled=false; btn.textContent=orig; }
+}
+
+async function _aiProfileIp(ip, btn){
+  const body=document.getElementById('aiIpProfileBody');
+  if(!body) return;
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Profiling…';
+  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);padding:6px 0;">Profiling IP (15-40s)…</div>';
+  try{
+    const r=await api('/api/ai/profile-ip/'+encodeURIComponent(ip));
+    if(r && !r.error){
+      const inds=(r.notable_indicators||[]).map(k=>`<li style="font-size:11px;margin:2px 0;">${esc(k)}</li>`).join('');
+      const cColors={high:'var(--success)',medium:'var(--medium)',low:'var(--text-dim)'};
+      body.innerHTML=`<div style="padding:10px 14px;background:rgba(139,92,246,.08);border-left:3px solid #8b5cf6;border-radius:6px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <strong style="font-size:12px;">Attribution: ${esc(r.attribution||'unknown')}</strong>
+          <span style="font-size:9px;color:${cColors[r.confidence]||'#666'};text-transform:uppercase;letter-spacing:.5px;font-weight:700;">${esc(r.confidence||'low')} confidence</span>
+        </div>
+        <div style="font-size:11px;color:var(--text);line-height:1.5;margin-bottom:8px;">${esc(r.profile||'')}</div>
+        ${inds?`<div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;font-weight:700;margin-bottom:2px;">Notable</div><ul style="margin:0;padding-left:18px;">${inds}</ul>`:''}
+        <div style="font-size:11px;padding:4px 8px;background:var(--bg);border-radius:4px;margin-top:6px;"><strong>Next:</strong> ${esc(r.investigate_next||'')}</div>
+        <div style="font-size:9px;color:var(--text-dim);margin-top:6px;font-style:italic;">Model: ${esc(r._model||'?')}</div>
+      </div>`;
+    } else {
+      body.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">AI unavailable: ${esc(r?.error||'unknown')}</div>`;
+    }
+  } finally { btn.disabled=false; btn.textContent=orig; }
+}
+
+async function _aiIocNarrative(inputEl){
+  const val=(inputEl.value||'').trim();
+  if(!val){showToast('Enter an IOC value first','warning');return;}
+  const type=document.getElementById('iocNarType').value;
+  const body=document.getElementById('aiIocNarrativeBody');
+  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);padding:6px 0;">Analyzing (15-40s)…</div>';
+  try{
+    const r=await apiPost('/api/ai/ioc-narrative',{type,value:val});
+    if(r && !r.error){
+      const vColors={malicious:'#dc2626',suspicious:'#f59e0b',benign:'#10b981',unknown:'#6b7280'};
+      const c=vColors[r.verdict]||'#666';
+      const actionColors={block:'#dc2626',watchlist:'#f59e0b',monitor:'#3b82f6',dismiss:'#10b981'};
+      const ac=actionColors[r.recommended_action]||'#666';
+      body.innerHTML=`<div style="padding:12px 14px;background:${c}11;border-left:3px solid ${c};border-radius:6px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px;">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <strong style="color:${c};font-size:13px;text-transform:uppercase;">${esc(r.verdict||'?')}</strong>
+            <span style="font-size:10px;color:var(--text-dim);">Risk score:</span>
+            <strong style="font-size:14px;color:${c};">${r.risk_score||0}/100</strong>
+          </div>
+          <span style="background:${ac};color:#fff;padding:3px 10px;border-radius:10px;font-size:10px;text-transform:uppercase;letter-spacing:.5px;font-weight:700;">${esc(r.recommended_action||'?')}</span>
+        </div>
+        <div style="font-size:12px;color:var(--text);line-height:1.5;margin-bottom:6px;">${esc(r.narrative||'')}</div>
+        <div style="font-size:10px;color:var(--text-dim);"><strong>Why:</strong> ${esc(r.reasoning||'')}</div>
+        <div style="font-size:9px;color:var(--text-dim);margin-top:6px;font-style:italic;">Model: ${esc(r._model||'?')}</div>
+      </div>`;
+    } else {
+      body.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">AI unavailable: ${esc(r?.error||'unknown')}</div>`;
+    }
+  }catch(e){
+    body.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function _aiAssetModal(ip, owner){
+  const overlay=document.createElement('div');
+  overlay.className='modal-overlay';
+  overlay.onclick=e=>{if(e.target===overlay)overlay.remove();};
+  overlay.innerHTML=`<div class="modal" style="max-width:720px;max-height:90vh;overflow-y:auto;">
+    <h2 style="margin:0 0 4px;">🧠 AI Asset Analysis — ${esc(ip)}${owner?' ('+esc(owner)+')':''}</h2>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;">Local LLM examines this asset's traffic patterns.</div>
+    <div style="display:flex;gap:8px;margin-bottom:12px;">
+      <button class="btn btn-sm btn-primary" onclick="_aiRunAssetProfile('${esc(ip)}',this)">Profile Behavior</button>
+      <button class="btn btn-sm" onclick="_aiRunAssetClassify('${esc(ip)}',this)">Auto-Classify</button>
+    </div>
+    <div id="aiAssetProfileBody" style="margin-bottom:10px;"></div>
+    <div id="aiAssetClassifyBody"></div>
+    <div class="actions" style="margin-top:14px;text-align:right;">
+      <button class="btn" onclick="this.closest('.modal-overlay').remove()">Close</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+}
+async function _aiRunAssetProfile(ip, btn){
+  const body=document.getElementById('aiAssetProfileBody');
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Profiling…';
+  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);">Analyzing behavior (15-40s)…</div>';
+  try{
+    const r=await api('/api/ai/profile-asset/'+encodeURIComponent(ip));
+    if(r && !r.error){
+      body.innerHTML=`<div style="padding:10px 14px;background:rgba(139,92,246,.08);border-left:3px solid #8b5cf6;border-radius:6px;font-size:11px;">
+        <div style="margin-bottom:4px;"><strong>Role:</strong> ${esc(r.role_summary||'')}</div>
+        <div style="margin-bottom:4px;"><strong>Normal:</strong> ${esc(r.normal_behavior||'')}</div>
+        <div style="margin-bottom:4px;"><strong>Recent changes:</strong> ${esc(r.recent_changes||'')}</div>
+        <div><strong>Watch for:</strong> ${esc(r.watch_for||'')}</div>
+      </div>`;
+    } else {
+      body.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">${esc(r?.error||'unknown')}</div>`;
+    }
+  } finally { btn.disabled=false; btn.textContent=orig; }
+}
+async function _aiRunAssetClassify(ip, btn){
+  const body=document.getElementById('aiAssetClassifyBody');
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Classifying…';
+  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);">Classifying (15-30s)…</div>';
+  try{
+    const r=await api('/api/ai/classify-asset/'+encodeURIComponent(ip));
+    if(r && !r.error){
+      body.innerHTML=`<div style="padding:10px 14px;background:rgba(16,185,129,.08);border-left:3px solid #10b981;border-radius:6px;font-size:11px;">
+        <div style="margin-bottom:4px;"><strong>Type:</strong> ${esc(r.asset_type||'')} · <strong>Role:</strong> ${esc(r.specific_role||'')}</div>
+        <div style="margin-bottom:4px;font-size:10px;color:var(--text-dim);">Confidence: ${esc(r.confidence||'low')}</div>
+        <div><strong>Reasoning:</strong> ${esc(r.reasoning||'')}</div>
+      </div>`;
+    } else {
+      body.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">${esc(r?.error||'unknown')}</div>`;
+    }
+  } finally { btn.disabled=false; btn.textContent=orig; }
+}
+
 async function _aiAnalyze(id, btn){
   const body=document.getElementById('aiAnalysisBody');
   if(!body) return;
@@ -7699,6 +7907,23 @@ async function loadIntel(){
   _intelData={ja4,tunnel,beacons,mac,tor};
   window._tfData=tfStatus;
   let h='';
+  // AI IOC narrative panel
+  h+=`<div class="detail-panel" style="padding:12px;margin-bottom:12px;border-left:3px solid #8b5cf6;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <div>
+        <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;font-weight:700;">🧠 IOC Narrative</div>
+        <div style="font-size:10px;color:var(--text-dim);margin-top:2px;">Ask the local LLM about any IP or domain — it assembles VT + AbuseIPDB + GeoIP + local history.</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+      <select id="iocNarType" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:6px 8px;border-radius:4px;font-size:11px;">
+        <option value="ip">IP</option><option value="domain">Domain</option><option value="url">URL</option>
+      </select>
+      <input type="text" id="iocNarValue" placeholder="Enter IOC value (e.g. 185.107.57.64)" style="flex:1;min-width:240px;padding:6px 10px;font-size:12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;" onkeydown="if(event.key==='Enter'){_aiIocNarrative(this);}">
+      <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiIocNarrative(document.getElementById('iocNarValue'))">Analyze</button>
+    </div>
+    <div id="aiIocNarrativeBody" style="margin-top:8px;"></div>
+  </div>`;
   const tfS=tfStatus?.summary||{};
   const tfM=tfStatus?.matches||{};
   h+='<div class="cards">';
@@ -9800,6 +10025,65 @@ async function _showRuleText(sid){
 }
 
 // AI: rapid triage of a single alert (called from alert detail modal)
+// ═════════ Session 1 dashboard AI helpers ═════════
+async function _aiDashBriefing(btn){
+  const body=document.getElementById('aiDashBriefingBody');
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Thinking…';
+  body.innerHTML='<span style="color:var(--text-dim);">Generating briefing (15-40s)…</span>';
+  try{
+    const r=await api('/api/ai/dashboard-briefing');
+    if(r && !r.error){
+      const focus=(r.focus_areas||[]).map(f=>`<li style="font-size:11px;margin:2px 0;">${esc(f)}</li>`).join('');
+      body.innerHTML=`<div style="font-size:12px;font-weight:700;color:var(--text);margin-bottom:6px;">${esc(r.headline||'')}</div>
+        <div style="font-size:11px;color:var(--text);margin-bottom:4px;"><strong>Yesterday:</strong> ${esc(r.yesterday||'')}</div>
+        <div style="font-size:11px;color:var(--text);margin-bottom:6px;"><strong>Today:</strong> ${esc(r.today_so_far||'')}</div>
+        ${focus?`<div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;font-weight:700;margin-bottom:2px;">Focus areas</div><ul style="margin:0;padding-left:16px;">${focus}</ul>`:''}
+        <div style="font-size:9px;color:var(--text-dim);margin-top:6px;font-style:italic;">Model: ${esc(r._model||'?')}</div>`;
+    } else {
+      body.innerHTML=`<span style="color:var(--critical);">AI unavailable: ${esc(r?.error||'unknown')}</span>`;
+    }
+  } finally { btn.disabled=false; btn.textContent=orig; }
+}
+async function _aiStateOfSec(btn){
+  const body=document.getElementById('aiStateOfSecBody');
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Thinking…';
+  body.innerHTML='<span style="color:var(--text-dim);">Checking…</span>';
+  try{
+    const r=await api('/api/ai/state-of-security');
+    if(r && !r.error){
+      const lightColors={green:'#10b981',yellow:'#f59e0b',red:'#dc2626'};
+      const c=lightColors[r.assessment]||'#666';
+      body.innerHTML=`<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:${c};"></span>
+        <strong style="color:${c};text-transform:uppercase;font-size:11px;">${esc(r.assessment||'?')}</strong>
+      </div>
+      <div style="font-size:11px;color:var(--text);margin-bottom:4px;">${esc(r.summary||'')}</div>
+      <div style="font-size:10px;color:var(--text-dim);font-style:italic;">${esc(r.reasoning||'')}</div>`;
+    } else {
+      body.innerHTML=`<span style="color:var(--critical);">${esc(r?.error||'unknown')}</span>`;
+    }
+  } finally { btn.disabled=false; btn.textContent=orig; }
+}
+async function _aiAnomalyNarrator(btn){
+  const body=document.getElementById('aiAnomalyBody');
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Thinking…';
+  body.innerHTML='<span style="color:var(--text-dim);">Scanning…</span>';
+  try{
+    const r=await api('/api/ai/anomaly-narrator');
+    if(r && !r.error){
+      const c=r.is_anomalous?'#f59e0b':'#10b981';
+      const label=r.is_anomalous?'⚠ ANOMALOUS':'✓ Normal';
+      body.innerHTML=`<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+        <strong style="color:${c};font-size:11px;">${label}</strong>
+      </div>
+      <div style="font-size:11px;color:var(--text);margin-bottom:4px;">${esc(r.explanation||'')}</div>
+      <div style="font-size:10px;color:var(--text-dim);"><strong>Suggested:</strong> ${esc(r.suggested_action||'')}</div>`;
+    } else {
+      body.innerHTML=`<span style="color:var(--critical);">${esc(r?.error||'unknown')}</span>`;
+    }
+  } finally { btn.disabled=false; btn.textContent=orig; }
+}
+
 async function _aiAnalyzeAlert(alert, btn){
   const body=document.getElementById('aiAlertTriageBody');
   if(!body) return;
