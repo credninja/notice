@@ -5258,50 +5258,47 @@ async function _aiAssetModal(ip, owner){
     <h2 style="margin:0 0 4px;">🧠 AI Asset Analysis — ${esc(ip)}${owner?' ('+esc(owner)+')':''}</h2>
     <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;">Local LLM examines this asset's traffic patterns.</div>
     <div style="display:flex;gap:8px;margin-bottom:12px;">
-      <button class="btn btn-sm btn-primary" onclick="_aiRunAssetProfile('${esc(ip)}',this)">Profile Behavior</button>
-      <button class="btn btn-sm" onclick="_aiRunAssetClassify('${esc(ip)}',this)">Auto-Classify</button>
+      <button class="btn btn-sm btn-primary" onclick="_aiRunAssetAnalyze('${esc(ip)}',this)">Run Analysis</button>
     </div>
-    <div id="aiAssetProfileBody" style="margin-bottom:10px;"></div>
-    <div id="aiAssetClassifyBody"></div>
+    <div id="aiAssetAnalyzeBody"></div>
     <div class="actions" style="margin-top:14px;text-align:right;">
       <button class="btn" onclick="this.closest('.modal-overlay').remove()">Close</button>
     </div>
   </div>`;
   document.body.appendChild(overlay);
 }
-async function _aiRunAssetProfile(ip, btn){
-  const body=document.getElementById('aiAssetProfileBody');
-  btn.disabled=true; const orig=btn.textContent; btn.textContent='Profiling…';
-  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);">Analyzing behavior (15-40s)…</div>';
+async function _aiRunAssetAnalyze(ip, btn){
+  const body=document.getElementById('aiAssetAnalyzeBody');
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='Analyzing…';
+  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);">Running classification + behavior profile (30-60s)…</div>';
   try{
-    const r=await api('/api/ai/profile-asset/'+encodeURIComponent(ip));
-    if(r && !r.error){
-      body.innerHTML=`<div style="padding:10px 14px;background:rgba(139,92,246,.08);border-left:3px solid #8b5cf6;border-radius:6px;font-size:11px;">
-        <div style="margin-bottom:4px;"><strong>Role:</strong> ${esc(r.role_summary||'')}</div>
-        <div style="margin-bottom:4px;"><strong>Normal:</strong> ${esc(r.normal_behavior||'')}</div>
-        <div style="margin-bottom:4px;"><strong>Recent changes:</strong> ${esc(r.recent_changes||'')}</div>
-        <div><strong>Watch for:</strong> ${esc(r.watch_for||'')}</div>
-      </div>`;
-    } else {
-      body.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">${esc(r?.error||'unknown')}</div>`;
+    const [cls, prof]=await Promise.all([
+      api('/api/ai/classify-asset/'+encodeURIComponent(ip)),
+      api('/api/ai/profile-asset/'+encodeURIComponent(ip)),
+    ]);
+    const clsErr=!cls||cls.error;
+    const profErr=!prof||prof.error;
+    if(clsErr && profErr){
+      body.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">${esc(cls?.error||prof?.error||'unknown')}</div>`;
+      return;
     }
-  } finally { btn.disabled=false; btn.textContent=orig; }
-}
-async function _aiRunAssetClassify(ip, btn){
-  const body=document.getElementById('aiAssetClassifyBody');
-  btn.disabled=true; const orig=btn.textContent; btn.textContent='Classifying…';
-  body.innerHTML='<div style="font-size:11px;color:var(--text-dim);">Classifying (15-30s)…</div>';
-  try{
-    const r=await api('/api/ai/classify-asset/'+encodeURIComponent(ip));
-    if(r && !r.error){
-      body.innerHTML=`<div style="padding:10px 14px;background:rgba(16,185,129,.08);border-left:3px solid #10b981;border-radius:6px;font-size:11px;">
-        <div style="margin-bottom:4px;"><strong>Type:</strong> ${esc(r.asset_type||'')} · <strong>Role:</strong> ${esc(r.specific_role||'')}</div>
-        <div style="margin-bottom:4px;font-size:10px;color:var(--text-dim);">Confidence: ${esc(r.confidence||'low')}</div>
-        <div><strong>Reasoning:</strong> ${esc(r.reasoning||'')}</div>
-      </div>`;
-    } else {
-      body.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">${esc(r?.error||'unknown')}</div>`;
-    }
+    const type=clsErr?'—':(cls.asset_type||'unknown');
+    const role=clsErr?'—':(cls.specific_role||'unknown');
+    const confidence=clsErr?'low':(cls.confidence||'low');
+    const reasoning=clsErr?'':cls.reasoning||'';
+    const normal=profErr?'':prof.normal_behavior||'';
+    const changes=profErr?'':prof.recent_changes||'';
+    const watch=profErr?'':prof.watch_for||'';
+    body.innerHTML=`<div style="padding:10px 14px;background:rgba(16,185,129,.08);border-left:3px solid #10b981;border-radius:6px;font-size:11px;margin-bottom:10px;">
+        <div style="margin-bottom:4px;"><strong>Type:</strong> ${esc(type)} · <strong>Role:</strong> ${esc(role)}</div>
+        <div style="margin-bottom:4px;font-size:10px;color:var(--text-dim);">Confidence: ${esc(confidence)}</div>
+        ${reasoning?`<div><strong>Reasoning:</strong> ${esc(reasoning)}</div>`:''}
+      </div>
+      ${(normal||changes||watch)?`<div style="padding:10px 14px;background:rgba(139,92,246,.08);border-left:3px solid #8b5cf6;border-radius:6px;font-size:11px;">
+        ${normal?`<div style="margin-bottom:4px;"><strong>Normal:</strong> ${esc(normal)}</div>`:''}
+        ${changes?`<div style="margin-bottom:4px;"><strong>Recent changes:</strong> ${esc(changes)}</div>`:''}
+        ${watch?`<div><strong>Watch for:</strong> ${esc(watch)}</div>`:''}
+      </div>`:''}`;
   } finally { btn.disabled=false; btn.textContent=orig; }
 }
 
@@ -10159,11 +10156,12 @@ async function _aiRuleGenGo(btn){
         <pre style="font-family:monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;padding:10px;background:#1e293b;color:#e2e8f0;border-radius:4px;margin:0 0 8px 0;">${esc(rule)}</pre>
         <div style="font-size:11px;color:var(--text);margin-bottom:6px;"><strong>What it catches:</strong> ${esc(r.explanation||'')}</div>
         <div style="font-size:11px;color:var(--text);margin-bottom:8px;"><strong>Caveats:</strong> ${esc(r.caveats||'')}</div>
-        <div style="display:flex;gap:8px;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
           <button class="btn btn-sm" onclick="navigator.clipboard.writeText(\`${rule.replace(/\`/g,'\\\`').replace(/\$/g,'\\$')}\`);showToast('Rule copied','success');">Copy Rule</button>
-          <button class="btn btn-sm btn-primary" onclick="_aiRuleGenAcceptToEditor(\`${rule.replace(/\`/g,'\\\`').replace(/\$/g,'\\$')}\`)">Open in Editor</button>
+          <button class="btn btn-sm" onclick="_aiRuleGenAcceptToEditor(\`${rule.replace(/\`/g,'\\\`').replace(/\$/g,'\\$')}\`)">Open in Editor</button>
+          <button class="btn btn-sm btn-primary" onclick="_aiRuleGenDeploy(\`${rule.replace(/\`/g,'\\\`').replace(/\$/g,'\\$')}\`,\`${(r.explanation||'').replace(/`/g,'').replace(/\$/g,'').slice(0,120)}\`,this)">Save &amp; Deploy</button>
         </div>
-        <div style="font-size:9px;color:var(--text-dim);margin-top:8px;font-style:italic;">Model: ${esc(r._model||'?')} · Change the sid=9999999 before deploying to avoid collision.</div>
+        <div style="font-size:9px;color:var(--text-dim);margin-top:8px;font-style:italic;">Model: ${esc(r._model||'?')} · Save &amp; Deploy assigns a fresh sid and writes to the rules file (reload the engine to activate).</div>
       </div>`;
     } else {
       result.innerHTML=`<div style="padding:8px;color:var(--critical);font-size:11px;">AI unavailable: ${esc(r?.error||'unknown')}</div>`;
@@ -10187,6 +10185,34 @@ function _aiRuleGenAcceptToEditor(rule){
   } else {
     showToast('Rule Manager unavailable; copy the rule manually','warning');
   }
+}
+
+async function _aiRuleGenDeploy(rule, explanation, btn){
+  // Extract msg from the rule for the DB record; fall back to the LLM explanation.
+  let msg='AI-generated rule';
+  const m=rule.match(/msg\s*:\s*"([^"]+)"/i);
+  if(m) msg=m[1];
+  else if(explanation) msg=explanation.slice(0,90);
+  showConfirm('Save & deploy AI-generated rule?',
+    `This will:\n  1) Save the rule to your user_rules (fresh sid auto-assigned)\n  2) Write all enabled user rules to disk\n\nYou still need to reload the detection engine to activate it.\n\nMsg: "${msg}"`,
+    async()=>{
+      btn.disabled=true; const orig=btn.textContent; btn.textContent='Deploying…';
+      try{
+        const saved=await apiPost('/api/rules/user',{msg, raw_rule:rule, enabled:true});
+        if(!saved || saved.error){
+          showToast('Save failed: '+(saved?.error||'unknown'),'error',8000);
+          return;
+        }
+        const applied=await apiPost('/api/rules/user/apply',{});
+        if(applied && applied.ok){
+          showToast(`Saved as sid ${saved.sid} and wrote ${applied.rules_written} rules to ${applied.rules_file}. Reload the engine to activate.`,'success',10000);
+          // Close the generator modal since work is done
+          document.querySelectorAll('.modal-overlay').forEach(o=>o.remove());
+        } else {
+          showToast('Saved as sid '+saved.sid+' but apply failed: '+(applied?.error||'unknown'),'warning',10000);
+        }
+      } finally { btn.disabled=false; btn.textContent=orig; }
+    });
 }
 
 // AI: explain a Suricata rule
