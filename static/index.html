@@ -3394,21 +3394,26 @@ async function loadIncidents(){
   window._incidents=d.incidents;
   _loadMyDashboard();
 
-  // Apply pending filter set by a jump from another page (e.g. Security Health chips)
+  // Apply pending filter set by a jump from another page (e.g. Security Health chips).
+  // We deliberately filter on raw status/severity here (not _incidentMatchesFilter) so
+  // the numbers line up with the chip counts (which come from a plain
+  // `WHERE status='open'` — no phase restriction).
   if(window._pendingIncStatus || window._pendingIncSeverity){
     const st=window._pendingIncStatus||'';
     const sev=window._pendingIncSeverity||'';
     window._pendingIncStatus=''; window._pendingIncSeverity='';
     const filtered=window._incidents.filter(i=>{
-      if(st && !_incidentMatchesFilter(i, st)) return false;
+      if(st==='open' && i.status==='closed') return false;
+      if(st && st!=='open' && i.status!==st) return false;
       if(sev && (i.severity||'')!==sev) return false;
       return true;
     });
     document.getElementById('incidentList').innerHTML=renderIncidentList(filtered);
-    // Reflect the status filter in the top tabs so the user sees why the list is trimmed
-    const btn=document.querySelector('#incStatusFilter .sub-tab[onclick*="\''+st+'\'"]');
-    if(btn){document.querySelectorAll('#incStatusFilter .sub-tab').forEach(b=>b.classList.remove('active'));btn.classList.add('active');}
-    if(sev){showToast(`Filtered to ${sev} severity`,'info',3000);}
+    // Highlight the "All" tab (since we are showing all statuses matching the severity)
+    const allBtn=document.querySelector('#incStatusFilter .sub-tab');
+    if(allBtn){document.querySelectorAll('#incStatusFilter .sub-tab').forEach(b=>b.classList.remove('active'));allBtn.classList.add('active');}
+    if(sev) showToast(`Showing ${filtered.length} ${sev}-severity open incidents`,'info',4000);
+    else if(st) showToast(`Showing ${filtered.length} open incidents`,'info',4000);
   }
 }
 
@@ -10114,8 +10119,8 @@ function jumpToIncidents(status, severity){
   window._pendingIncStatus=status||'';
   window._pendingIncSeverity=severity||'';
   window._incidentsView='list';
-  pageLoaded['incidents']=false;
   navigateTo('incidents');
+  loadIncidents();
 }
 async function _aiAnomalyNarrator(btn){
   const body=document.getElementById('aiAnomalyBody');
