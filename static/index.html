@@ -3367,7 +3367,7 @@ async function loadIncidents(){
       <button class="sub-tab" style="border-left:1px solid var(--border);margin-left:4px;padding-left:12px;" onclick="filterIncidents('mine')">My Incidents <span class="rpt-count">(${_cntMine})</span></button>
     </div>
     <div style="display:flex;gap:6px;">
-      <button class="btn btn-sm" style="border-color:var(--medium);color:var(--medium);" onclick="bulkAutoResolve()">Smart Resolve Queue</button>
+      <button class="btn btn-sm" style="border-color:var(--medium);color:var(--medium);" onclick="bulkAutoResolve()" title="Runs every non-closed incident through your Smart Rules. Rules with action=close_fp or close_tp will close matching incidents automatically. Investigate/Escalate rules only modify verdict/phase — they do not close.">Smart Resolve Queue</button>
       <button class="btn btn-primary" onclick="showIncidentModal()">+ New Incident</button>
     </div>
   </div>`;
@@ -3393,6 +3393,23 @@ async function loadIncidents(){
   el.innerHTML=h;
   window._incidents=d.incidents;
   _loadMyDashboard();
+
+  // Apply pending filter set by a jump from another page (e.g. Security Health chips)
+  if(window._pendingIncStatus || window._pendingIncSeverity){
+    const st=window._pendingIncStatus||'';
+    const sev=window._pendingIncSeverity||'';
+    window._pendingIncStatus=''; window._pendingIncSeverity='';
+    const filtered=window._incidents.filter(i=>{
+      if(st && !_incidentMatchesFilter(i, st)) return false;
+      if(sev && (i.severity||'')!==sev) return false;
+      return true;
+    });
+    document.getElementById('incidentList').innerHTML=renderIncidentList(filtered);
+    // Reflect the status filter in the top tabs so the user sees why the list is trimmed
+    const btn=document.querySelector('#incStatusFilter .sub-tab[onclick*="\''+st+'\'"]');
+    if(btn){document.querySelectorAll('#incStatusFilter .sub-tab').forEach(b=>b.classList.remove('active'));btn.classList.add('active');}
+    if(sev){showToast(`Filtered to ${sev} severity`,'info',3000);}
+  }
 }
 
 // Analyst dashboard card — personal queue summary at top of Incidents tab
@@ -6171,7 +6188,18 @@ async function _executeBulkAuto(btn){
   const r=await apiPost('/api/incidents/auto-resolve-bulk',{dry_run:false});
   if(r?.ok){
     btn.closest('.modal-overlay').remove();
-    showToast(`Smart-resolved ${r.total_matched} incidents`,'success');
+    // Break down what actually happened, so the user knows whether incidents were
+    // closed or just re-tagged as investigating/escalated.
+    const tally={close_fp:0,close_tp:0,investigate:0,escalate:0,other:0};
+    (r.results||[]).forEach(x=>{tally[x.action]!==undefined?tally[x.action]++:tally.other++;});
+    const closed=tally.close_fp+tally.close_tp;
+    const parts=[];
+    if(tally.close_fp) parts.push(`${tally.close_fp} closed as FP`);
+    if(tally.close_tp) parts.push(`${tally.close_tp} closed as TP`);
+    if(tally.investigate) parts.push(`${tally.investigate} → investigating`);
+    if(tally.escalate) parts.push(`${tally.escalate} escalated`);
+    const msg=parts.length ? parts.join(', ') : `${r.total_matched} matched`;
+    showToast(`Smart Resolve: ${msg}${closed?'':' (nothing closed — your rules use investigate/escalate actions, not close)'}`,'success',8000);
     loadIncidents();
   } else {
     btn.disabled=false;btn.textContent='Apply';
@@ -10048,7 +10076,6 @@ async function _aiStateOfSec(btn){
     const r=await api('/api/ai/state-of-security');
     if(r && !r.error){
       const lightColors={green:'#10b981',yellow:'#f59e0b',red:'#dc2626'};
-      // Normalise assessment — strip anything like "traffic_light — " prefix and lowercase
       const rawAssessment=String(r.assessment||'').toLowerCase();
       let assessment='unknown';
       if(rawAssessment.includes('green')) assessment='green';
@@ -10056,16 +10083,39 @@ async function _aiStateOfSec(btn){
       else if(rawAssessment.includes('red')) assessment='red';
       const c=lightColors[assessment]||'#666';
       const labels={green:'ALL CLEAR',yellow:'KEEP AN EYE ON',red:'NEEDS ATTENTION'};
+
+      // Clickable severity chips — jump to filtered incident view
+      const sev=r._open_by_severity||{};
+      const total=r._open_total||0;
+      const sevColors={critical:'#dc2626',high:'#f59e0b',medium:'#3b82f6',low:'#6b7280'};
+      const chipOrder=['critical','high','medium','low'];
+      let chips=`<button class="link-btn" style="font-size:10px;padding:2px 8px;border:1px solid var(--border);border-radius:12px;background:transparent;color:var(--text);cursor:pointer;" onclick="jumpToIncidents('open','')">${total} open →</button>`;
+      chipOrder.forEach(s=>{
+        const n=sev[s]||0;
+        if(n>0){
+          chips+=`<button class="link-btn" style="font-size:10px;padding:2px 8px;border:1px solid ${sevColors[s]};border-radius:12px;background:transparent;color:${sevColors[s]};cursor:pointer;margin-left:4px;" onclick="jumpToIncidents('open','${s}')">${n} ${s} →</button>`;
+        }
+      });
+
       body.innerHTML=`<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
         <span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:${c};"></span>
         <strong style="color:${c};text-transform:uppercase;font-size:11px;letter-spacing:.5px;">${labels[assessment]||assessment}</strong>
       </div>
       <div style="font-size:11px;color:var(--text);margin-bottom:4px;">${esc(r.summary||'')}</div>
-      <div style="font-size:10px;color:var(--text-dim);font-style:italic;">${esc(r.reasoning||'')}</div>`;
+      <div style="font-size:10px;color:var(--text-dim);font-style:italic;margin-bottom:6px;">${esc(r.reasoning||'')}</div>
+      ${total>0?`<div style="margin-top:6px;">${chips}</div>`:''}`;
     } else {
       body.innerHTML=`<span style="color:var(--critical);">${esc(r?.error||'unknown')}</span>`;
     }
   } finally { btn.disabled=false; btn.textContent=orig; }
+}
+
+function jumpToIncidents(status, severity){
+  window._pendingIncStatus=status||'';
+  window._pendingIncSeverity=severity||'';
+  window._incidentsView='list';
+  pageLoaded['incidents']=false;
+  navigateTo('incidents');
 }
 async function _aiAnomalyNarrator(btn){
   const body=document.getElementById('aiAnomalyBody');

@@ -1871,7 +1871,12 @@ def register(app):
             response.status = 503; return {"error": f"LLM unavailable: {e}"}
         conn = get_db()
         open_c = conn.execute("SELECT COUNT(*) as c FROM incidents WHERE status='open'").fetchone()["c"]
-        open_crit = conn.execute("SELECT COUNT(*) as c FROM incidents WHERE status='open' AND severity='critical'").fetchone()["c"]
+        # Per-severity breakdown (used to render clickable quick-jump chips)
+        sev_rows = conn.execute(
+            "SELECT severity, COUNT(*) as c FROM incidents WHERE status='open' GROUP BY severity"
+        ).fetchall()
+        open_by_sev = {r["severity"] or "unknown": r["c"] for r in sev_rows}
+        open_crit = open_by_sev.get("critical", 0)
         recent_tp = conn.execute(
             "SELECT COUNT(*) as c FROM incidents WHERE verdict='true_positive' "
             "AND resolved_at > datetime('now','-1 day','localtime')"
@@ -1902,7 +1907,12 @@ def register(app):
             "active_blocks": active_blocks, "active_quarantines": active_qs,
         }
         r = state_of_security(stats)
-        if "error" in r: response.status = 503
+        if "error" in r:
+            response.status = 503
+        else:
+            # Frontend uses this to render clickable severity chips
+            r["_open_by_severity"] = open_by_sev
+            r["_open_total"] = open_c
         return r
 
     # ── Dashboard: anomaly narrator ──
@@ -1913,22 +1923,42 @@ def register(app):
         except Exception as e:
             response.status = 503; return {"error": f"LLM unavailable: {e}"}
         conn = get_db()
+        # Alerts in the last full hour, and a 23-hour baseline covering the
+        # rest of the last 24 hours. Uses float average so a rate like
+        # 6.9 alerts/hour is not truncated to 0.
         try:
             cur_alerts = conn.execute(
-                "SELECT COUNT(*) as c FROM ingested_alerts WHERE timestamp > datetime('now','-1 hour','localtime')"
-            ).fetchone()["c"]
-            baseline_alerts = conn.execute(
                 "SELECT COUNT(*) as c FROM ingested_alerts "
-                "WHERE timestamp > datetime('now','-8 hours','localtime') "
+                "WHERE timestamp > datetime('now','-1 hour','localtime')"
+            ).fetchone()["c"]
+            baseline_total = conn.execute(
+                "SELECT COUNT(*) as c FROM ingested_alerts "
+                "WHERE timestamp > datetime('now','-24 hours','localtime') "
                 "AND timestamp < datetime('now','-1 hour','localtime')"
-            ).fetchone()["c"] // 7  # per-hour avg from previous 7 hours
+            ).fetchone()["c"]
+            # How many hours of history do we actually have?
+            first_row = conn.execute(
+                "SELECT MIN(timestamp) as t FROM ingested_alerts"
+            ).fetchone()
+            hours_of_data = None
+            if first_row and first_row["t"]:
+                r_span = conn.execute(
+                    "SELECT (julianday('now','localtime') - julianday(?)) * 24.0 AS h",
+                    (first_row["t"],)
+                ).fetchone()
+                if r_span:
+                    hours_of_data = float(r_span["h"])
+            baseline_hours = min(23.0, hours_of_data - 1.0) if hours_of_data else 0.0
+            baseline_alerts = (baseline_total / baseline_hours) if baseline_hours > 0.5 else None
         except Exception:
-            cur_alerts = baseline_alerts = 0
-        cur_open = conn.execute("SELECT COUNT(*) as c FROM incidents WHERE status='open'").fetchone()["c"]
+            cur_alerts = 0
+            baseline_alerts = None
+            hours_of_data = 0
         conn.close()
         r = anomaly_narrator(
-            current_metrics={"alerts_per_hour": cur_alerts, "open_incidents": cur_open},
-            baseline_metrics={"alerts_per_hour": baseline_alerts, "open_incidents": max(cur_open // 2, 1)},
+            current_metrics={"alerts_per_hour": cur_alerts},
+            baseline_metrics={"alerts_per_hour": baseline_alerts},
+            hours_of_history=hours_of_data or 0,
         )
         if "error" in r: response.status = 503
         return r

@@ -609,26 +609,40 @@ def state_of_security(stats):
 
 
 _ANOMALY_SYSTEM = """You explain in plain English whether the network is behaving normally right now.
-Given current numbers and a baseline of what's typical, respond in JSON:
+Given the current alert rate and a baseline of what's typical, respond in JSON:
 {
   "is_anomalous": true | false,
-  "explanation": "2-3 sentences in plain English — no jargon like 'metric', 'baseline', 'standard deviation'. Say things like 'alerts are 3x higher than usual', 'this is normal for a weekday afternoon'.",
-  "suggested_action": "one sentence — should the analyst investigate, keep watching, or ignore"
+  "explanation": "2-3 sentences in plain English. Say things like 'alerts are 3x higher than usual' or 'this hour is quieter than normal, which is fine'. Do NOT say 'metric', 'standard deviation', 'baseline', or 'ratio'.",
+  "suggested_action": "one sentence — investigate now, keep watching, or nothing to do"
 }
 
 Rules:
-- Mark is_anomalous=true only if a value is roughly 2x its typical rate or higher.
-- If either current or baseline is 0, be careful — don't call it anomalous based on math alone.
-- If the ratio symbol shows "infx" or "infinite", that means the baseline was 0 — in that case just say "we don't have enough history to compare" instead of calling it anomalous."""
+- If the prompt says 'STATUS: insufficient_history', explain that the system has been collecting for less than an hour so there is nothing to compare against yet — set is_anomalous=false.
+- Otherwise mark is_anomalous=true only when the current rate is 2x the typical rate OR higher.
+- A current rate that is LOWER than baseline is normal — never anomalous.
+- If current=0 and baseline is small (<2/hr), just say the network is quiet."""
 
 
-def anomaly_narrator(current_metrics, baseline_metrics):
-    lines = ["Current vs baseline metrics:"]
-    for k in sorted(set(list(current_metrics.keys()) + list(baseline_metrics.keys()))):
-        cv = current_metrics.get(k, 0)
-        bv = baseline_metrics.get(k, 0)
-        ratio = (cv / bv) if bv else float("inf") if cv else 1
-        lines.append(f"  {k}: current={cv}, baseline={bv} ({ratio:.1f}x)")
+def anomaly_narrator(current_metrics, baseline_metrics, hours_of_history=0):
+    """current_metrics / baseline_metrics: dicts of metric_name -> number-or-None.
+    hours_of_history: how many hours of alert data the DB actually has."""
+    cur = current_metrics.get("alerts_per_hour", 0) or 0
+    base = baseline_metrics.get("alerts_per_hour")
+    lines = []
+    if base is None or hours_of_history < 1.5:
+        lines.append(f"STATUS: insufficient_history (system has {hours_of_history:.1f} hours of data)")
+        lines.append(f"current alerts in the last hour: {cur}")
+    else:
+        ratio = (cur / base) if base > 0 else (float("inf") if cur > 0 else 0.0)
+        ratio_str = "quiet" if base > 0 and cur == 0 else (
+            "much higher than usual" if ratio >= 2 else
+            "higher than usual" if ratio >= 1.3 else
+            "typical" if ratio >= 0.7 else
+            "lower than usual")
+        lines.append(f"Alerts in the last hour: {cur}")
+        lines.append(f"Typical alerts per hour (last 24h avg): {base:.1f}")
+        lines.append(f"Ratio: {ratio:.2f}x — {ratio_str}")
+        lines.append(f"History available: {hours_of_history:.1f} hours")
     prompt = "\n".join(lines) + "\n\nRespond in JSON per the schema."
     r = _call_ollama(prompt, system_prompt=_ANOMALY_SYSTEM, num_predict=250)
     if "error" not in r:
