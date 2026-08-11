@@ -3200,8 +3200,8 @@ async function loadAnomalies(){
       <tr class="anom-reasoning" style="display:none"><td colspan="10" style="background:var(--bg);padding:10px 14px;font-size:11px;line-height:1.6;">
         <strong style="color:var(--accent)">Why this is anomalous:</strong> ${esc(a.reasoning||'No reasoning available.')}
         <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">
-          <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="event.stopPropagation();aiAnomalyWhy('${esc(a.anomaly_type||'')}','${esc(a.src_ip||'')}','${esc((a.reasoning||'').replace(/'/g,'\\\'')).slice(0,300)}','${esc((a.dest_ip||'')+' :'+(a.port||''))}')">🧠 Why?</button>
-          <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="event.stopPropagation();aiAnomalyAction('${esc(a.anomaly_type||'')}','${esc(a.src_ip||'')}','${esc((a.reasoning||'').replace(/'/g,'\\\'')).slice(0,300)}')">🧠 Investigate or Dismiss?</button>
+          <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" data-anom='${esc(JSON.stringify({type:a.anomaly_type||'',ep:a.src_ip||'',desc:(a.reasoning||'').slice(0,300),ind:(a.dest_ip||'')+':'+(a.port||'')}))}' onclick="event.stopPropagation();const d=JSON.parse(this.dataset.anom);aiAnomalyWhy(d.type,d.ep,d.desc,d.ind);">🧠 Why?</button>
+          <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" data-anom='${esc(JSON.stringify({type:a.anomaly_type||'',ep:a.src_ip||'',desc:(a.reasoning||'').slice(0,300)}))}' onclick="event.stopPropagation();const d=JSON.parse(this.dataset.anom);aiAnomalyAction(d.type,d.ep,d.desc);">🧠 Investigate or Dismiss?</button>
         </div>
       </td></tr>`;
     });
@@ -4132,8 +4132,6 @@ async function showIncidentDetail(id){
       <div style="display:flex;gap:6px;flex-wrap:wrap;">
         <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiAnalyze(${d.id},this)">Analyze</button>
         <button class="btn btn-sm" style="background:#6366f1;color:#fff;border:none;" onclick="_aiSimilarInc(${d.id},this)">Similar History</button>
-        <button class="btn btn-sm" style="background:#10b981;color:#fff;border:none;" onclick="_aiPlaybook(${d.id},this)">Playbook</button>
-        <button class="btn btn-sm" style="background:#f59e0b;color:#fff;border:none;" onclick="_aiChain(${d.id},this)">Attack Chain</button>
         <button class="btn btn-sm" style="background:#ec4899;color:#fff;border:none;" onclick="aiAutoPromoteReasoning(${d.id})" title="Why was this alert promoted to an incident?">Why Promoted?</button>
       </div>
     </div>
@@ -10519,14 +10517,44 @@ async function _aiRuleGenDeploy(rule, explanation, btn){
         }
         const applied=await apiPost('/api/rules/user/apply',{});
         if(applied && applied.ok){
-          showToast(`Saved as sid ${saved.sid} and wrote ${applied.rules_written} rules to ${applied.rules_file}. Reload the engine to activate.`,'success',10000);
-          // Close the generator modal since work is done
-          document.querySelectorAll('.modal-overlay').forEach(o=>o.remove());
+          showToast(`Saved as sid ${saved.sid}. Reload the engine (sudo kill -USR2 $(pgrep -f suricata)) to activate. Delete anytime from Monitoring → Rule Manager.`,'success',12000);
+          // Swap Deploy button with a Delete button so the user can immediately undo
+          btn.textContent='Delete (sid '+saved.sid+')';
+          btn.style.background='#dc2626';
+          btn.disabled=false;
+          btn.onclick=()=>_aiRuleGenDelete(saved.sid, btn);
+          return;
         } else {
           showToast('Saved as sid '+saved.sid+' but apply failed: '+(applied?.error||'unknown'),'warning',10000);
+          btn.textContent='Delete (sid '+saved.sid+')';
+          btn.style.background='#dc2626';
+          btn.disabled=false;
+          btn.onclick=()=>_aiRuleGenDelete(saved.sid, btn);
+          return;
         }
-      } finally { btn.disabled=false; btn.textContent=orig; }
+      } finally { if(btn.textContent==='Deploying…'){btn.disabled=false; btn.textContent=orig;} }
     });
+}
+
+async function _aiRuleGenDelete(sid, btn){
+  if(!confirm('Delete rule sid '+sid+'? This removes it from user_rules and re-applies the rules file.')) return;
+  btn.disabled=true; btn.textContent='Deleting…';
+  try{
+    const del=await apiDelete('/api/rules/user/'+sid);
+    if(del && del.ok){
+      // Re-apply so the rules file no longer contains it
+      await apiPost('/api/rules/user/apply',{});
+      showToast('Deleted sid '+sid+' and rewrote rules file. Reload the engine to take effect.','success',10000);
+      // Close the generator modal now that the deploy has been reverted
+      document.querySelectorAll('.modal-overlay').forEach(o=>o.remove());
+    } else {
+      showToast('Delete failed: '+(del?.error||'unknown'),'error',8000);
+      btn.disabled=false; btn.textContent='Delete (sid '+sid+')';
+    }
+  } catch(e){
+    showToast('Delete failed: '+String(e),'error',8000);
+    btn.disabled=false; btn.textContent='Delete (sid '+sid+')';
+  }
 }
 
 // AI: explain a Suricata rule

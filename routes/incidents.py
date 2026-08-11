@@ -1938,16 +1938,21 @@ def register(app):
                 "AND timestamp < datetime('now','-1 hour','localtime')"
             ).fetchone()["c"]
             # How many hours of history do we actually have?
+            # SQLite's julianday() rejects ISO timestamps with fractional seconds
+            # or timezone offsets (e.g. "2026-08-11T10:39:35.881700+0530"), so
+            # strip both before feeding it in.
             first_row = conn.execute(
                 "SELECT MIN(timestamp) as t FROM ingested_alerts"
             ).fetchone()
             hours_of_data = None
             if first_row and first_row["t"]:
+                import re as _re
+                clean = _re.sub(r'([+-]\d{2}:?\d{2}|Z)$', '', first_row["t"]).split('.')[0]
                 r_span = conn.execute(
                     "SELECT (julianday('now','localtime') - julianday(?)) * 24.0 AS h",
-                    (first_row["t"],)
+                    (clean,)
                 ).fetchone()
-                if r_span:
+                if r_span and r_span["h"] is not None:
                     hours_of_data = float(r_span["h"])
             baseline_hours = min(23.0, hours_of_data - 1.0) if hours_of_data else 0.0
             baseline_alerts = (baseline_total / baseline_hours) if baseline_hours > 0.5 else None
