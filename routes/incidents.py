@@ -1807,33 +1807,79 @@ def register(app):
     # ── Dashboard: situation report (last 24h, timezone-safe) ──
     @app.get("/api/ai/dashboard-briefing")
     def ai_dash_briefing():
+        """Situation Report. Accepts:
+          ?minutes=<N>              (e.g. 60, 360, 1440, 10080, 43200)
+          ?from=<ISO>&to=<ISO>      (both required if given)
+        Defaults to last 24h (1440 min) for backwards compat.
+        """
         try:
             from analyzers.llm_assistant import dashboard_briefing
         except Exception as e:
             response.status = 503; return {"error": f"LLM unavailable: {e}"}
+
+        # ── Parse time range ──
+        from datetime import datetime as _dt, timedelta as _td
+        minutes_q = request.query.get("minutes", "").strip()
+        from_q = request.query.get("from", "").strip()
+        to_q = request.query.get("to", "").strip()
+
+        now = _dt.now()
+        if from_q and to_q:
+            # Explicit absolute range
+            try:
+                t_from = _dt.fromisoformat(from_q.replace("Z", ""))
+                t_to = _dt.fromisoformat(to_q.replace("Z", ""))
+                if t_to <= t_from:
+                    response.status = 400
+                    return {"error": "'to' must be after 'from'"}
+            except ValueError:
+                response.status = 400
+                return {"error": "from/to must be ISO 8601 (YYYY-MM-DDTHH:MM:SS)"}
+            window_label = f"between {t_from.strftime('%b %d %H:%M')} and {t_to.strftime('%b %d %H:%M')}"
+        else:
+            # Relative "last N minutes"
+            try:
+                mins = int(minutes_q) if minutes_q else 1440
+            except ValueError:
+                mins = 1440
+            mins = max(1, min(mins, 60 * 24 * 90))  # cap at 90 days
+            t_to = now
+            t_from = now - _td(minutes=mins)
+            # Human-friendly label
+            if mins < 60:
+                window_label = f"in the last {mins} minutes"
+            elif mins < 60 * 24:
+                window_label = f"in the last {mins // 60} hours"
+            elif mins < 60 * 24 * 7:
+                window_label = f"in the last {mins // (60 * 24)} days"
+            else:
+                window_label = f"in the last {mins // (60 * 24)} days"
+
+        from_str = t_from.strftime("%Y-%m-%d %H:%M:%S")
+        to_str = t_to.strftime("%Y-%m-%d %H:%M:%S")
+
+        # ── Queries (all use bound params) ──
         conn = get_db()
-        # Use time-based windows instead of date() to avoid timezone issues.
-        # ingested_alerts.timestamp is ISO 8601 with timezone offset — string
-        # compare against a bounded ISO string is reliable and fast (indexed).
         try:
-            alerts_24h = conn.execute(
+            alerts_in_window = conn.execute(
                 "SELECT COUNT(*) as c FROM ingested_alerts "
-                "WHERE timestamp >= datetime('now', '-1 day', 'localtime')"
+                "WHERE timestamp >= ? AND timestamp < ?",
+                (from_str, to_str)
             ).fetchone()["c"]
         except Exception:
-            alerts_24h = 0
+            alerts_in_window = 0
         open_total = conn.execute(
             "SELECT COUNT(*) as c FROM incidents WHERE status='open'"
         ).fetchone()["c"]
-        closed_tp_24h = conn.execute(
-            "SELECT COUNT(*) as c FROM incidents "
-            "WHERE status='closed' AND verdict='true_positive' "
-            "AND resolved_at > datetime('now', '-1 day', 'localtime')"
+        closed_tp_in_window = conn.execute(
+            "SELECT COUNT(*) as c FROM incidents WHERE status='closed' "
+            "AND verdict='true_positive' AND resolved_at >= ? AND resolved_at < ?",
+            (from_str, to_str)
         ).fetchone()["c"]
-        closed_fp_24h = conn.execute(
-            "SELECT COUNT(*) as c FROM incidents "
-            "WHERE status='closed' AND verdict='false_positive' "
-            "AND resolved_at > datetime('now', '-1 day', 'localtime')"
+        closed_fp_in_window = conn.execute(
+            "SELECT COUNT(*) as c FROM incidents WHERE status='closed' "
+            "AND verdict='false_positive' AND resolved_at >= ? AND resolved_at < ?",
+            (from_str, to_str)
         ).fetchone()["c"]
         top_open = [dict(r) for r in conn.execute(
             "SELECT title, severity FROM incidents WHERE status='open' "
@@ -1843,18 +1889,23 @@ def register(app):
         try:
             top_sigs = [{"name": r["signature"], "count": r["c"]} for r in conn.execute(
                 "SELECT signature, COUNT(*) as c FROM ingested_alerts "
-                "WHERE timestamp >= datetime('now', '-1 day', 'localtime') "
+                "WHERE timestamp >= ? AND timestamp < ? "
                 "AND signature IS NOT NULL AND signature != '' "
-                "GROUP BY signature ORDER BY c DESC LIMIT 5"
+                "GROUP BY signature ORDER BY c DESC LIMIT 5",
+                (from_str, to_str)
             ).fetchall()]
         except Exception:
             top_sigs = []
         conn.close()
+
         stats = {
-            "alerts_last_24h": alerts_24h,
+            "window_label": window_label,
+            "window_from": from_str,
+            "window_to": to_str,
+            "alerts_in_window": alerts_in_window,
             "open_incidents_total": open_total,
-            "incidents_closed_tp_24h": closed_tp_24h,
-            "incidents_closed_fp_24h": closed_fp_24h,
+            "incidents_closed_tp_in_window": closed_tp_in_window,
+            "incidents_closed_fp_in_window": closed_fp_in_window,
             "top_open_incidents": top_open,
             "top_signatures": top_sigs,
         }
@@ -3044,7 +3095,7 @@ def register(app):
         if "error" in r: response.status = 503
         return r
 
-    # ── Alerts: cluster story for a signature ──
+    # ── Alerts: cluster story for a signature (enriched context) ──
     @app.get("/api/ai/alert-cluster-story/<sid:int>")
     def ai_alert_cluster_story(sid):
         try:
@@ -3061,20 +3112,48 @@ def register(app):
         ).fetchone()
         if not r or r["c"] == 0:
             conn.close(); return {"error": f"no alerts in last 24h for sid={sid}"}
-        # common dst port
         port_row = conn.execute(
             "SELECT dest_port, COUNT(*) as c FROM ingested_alerts WHERE signature_id=? "
             "AND timestamp > datetime('now','-24 hours','localtime') "
             "AND dest_port IS NOT NULL GROUP BY dest_port ORDER BY c DESC LIMIT 1", (sid,)
         ).fetchone()
+        # Enrichment: top 3 src / dst IPs, prior verdict %, whether victims are registered assets
+        top_src = [row["src_ip"] for row in conn.execute(
+            "SELECT src_ip, COUNT(*) as c FROM ingested_alerts WHERE signature_id=? "
+            "AND timestamp > datetime('now','-24 hours','localtime') "
+            "GROUP BY src_ip ORDER BY c DESC LIMIT 3", (sid,)
+        ).fetchall()]
+        top_dst = [row["dest_ip"] for row in conn.execute(
+            "SELECT dest_ip, COUNT(*) as c FROM ingested_alerts WHERE signature_id=? "
+            "AND timestamp > datetime('now','-24 hours','localtime') "
+            "GROUP BY dest_ip ORDER BY c DESC LIMIT 3", (sid,)
+        ).fetchall()]
+        # Prior verdict split for this sig (closed incidents)
+        v_rows = conn.execute(
+            "SELECT verdict, COUNT(*) as c FROM incidents WHERE signature_id=? "
+            "AND status='closed' GROUP BY verdict", (sid,)
+        ).fetchall()
+        v_total = sum(row["c"] for row in v_rows) or 0
+        tp = sum(row["c"] for row in v_rows if row["verdict"] == "true_positive")
+        fp = sum(row["c"] for row in v_rows if row["verdict"] == "false_positive")
+        # How many top-dst IPs are registered/critical assets?
+        registered_dsts = 0
+        critical_dsts = 0
+        for ip in top_dst:
+            row = conn.execute(
+                "SELECT business_critical FROM assets WHERE ip=?", (ip,)
+            ).fetchone()
+            if row:
+                registered_dsts += 1
+                if row["business_critical"]:
+                    critical_dsts += 1
         conn.close()
-        # duration in minutes
         from datetime import datetime as _dt
         span_min = 0
         try:
-            f = _dt.fromisoformat((r["first_seen"] or "").replace("Z",""))
-            l = _dt.fromisoformat((r["last_seen"]  or "").replace("Z",""))
-            span_min = int((l - f).total_seconds() / 60)
+            f_ts = _dt.fromisoformat((r["first_seen"] or "").replace("Z", "").split("+")[0].split(".")[0])
+            l_ts = _dt.fromisoformat((r["last_seen"]  or "").replace("Z", "").split("+")[0].split(".")[0])
+            span_min = int((l_ts - f_ts).total_seconds() / 60)
         except Exception:
             pass
         out = alert_cluster_story({
@@ -3083,6 +3162,13 @@ def register(app):
             "span_minutes": span_min,
             "unique_src_ips": r["usrc"], "unique_dst_ips": r["udst"],
             "common_dst_port": port_row["dest_port"] if port_row else "n/a",
+            "top_src_ips": top_src,
+            "top_dst_ips": top_dst,
+            "prior_verdicts_total": v_total,
+            "prior_tp_pct": round(tp * 100 / v_total) if v_total else None,
+            "prior_fp_pct": round(fp * 100 / v_total) if v_total else None,
+            "registered_dst_assets": registered_dsts,
+            "critical_dst_assets": critical_dsts,
         })
         if "error" in out: response.status = 503
         return out
@@ -3116,6 +3202,18 @@ def register(app):
             ).fetchone()
             crit_asset = bool(row and row["business_critical"])
         conn.close()
+        # Prior verdict history for this signature — helps the LLM ground the answer
+        prior_tp = prior_fp = 0
+        if inc.get("signature_id"):
+            conn2 = get_db()
+            v_rows = conn2.execute(
+                "SELECT verdict, COUNT(*) as c FROM incidents WHERE signature_id=? "
+                "AND status='closed' GROUP BY verdict",
+                (inc["signature_id"],)
+            ).fetchall()
+            prior_tp = sum(r["c"] for r in v_rows if r["verdict"] == "true_positive")
+            prior_fp = sum(r["c"] for r in v_rows if r["verdict"] == "false_positive")
+            conn2.close()
         rule_hits = {
             "severity": inc.get("severity",""),
             "severity_qualifies": inc.get("severity") in ("critical","high"),
@@ -3124,6 +3222,8 @@ def register(app):
             "burst_qualifies": burst >= 3,
             "victim_is_critical_asset": crit_asset,
             "kill_chain_phase": inc.get("phase",""),
+            "prior_tp_for_sig": prior_tp,
+            "prior_fp_for_sig": prior_fp,
         }
         r = auto_promote_reasoning({
             "signature": inc.get("signature",""),

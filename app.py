@@ -41,7 +41,7 @@ from routes import (
     auth as auth_routes, notifications,
     case_mgmt, pcap, sigma as sigma_routes,
     dns_analytics, file_hash, attack_map, osint_feeds,
-    session_analytics,
+    session_analytics, knowledge_graph,
 )
 
 app = bottle.Bottle()
@@ -81,6 +81,7 @@ file_hash.register(app)
 attack_map.register(app)
 osint_feeds.register(app)
 session_analytics.register(app)
+knowledge_graph.register(app)
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

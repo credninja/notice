@@ -751,10 +751,10 @@ def health():
 
 # ── Dashboard situation report (formerly "morning briefing") ──
 _DASH_BRIEFING_SYSTEM = """You are a SOC lead writing a short factual situation report for another analyst.
-Given security activity numbers for the last 24 hours, respond in JSON:
+The input specifies the time window (e.g. 'in the last 6 hours' or 'between Aug 3 09:00 and Aug 3 15:00'). Respond in JSON:
 {
   "headline": "one-sentence bottom line — what's the current situation",
-  "recent_activity": "2-3 sentences describing what happened in the last 24 hours (cite the actual numbers you were given)",
+  "recent_activity": "2-3 sentences describing what happened IN THE STATED WINDOW (cite the actual numbers you were given, and use the exact window phrase, not 'the last 24 hours' unless that's what was stated)",
   "current_status": "one sentence on where things stand right now",
   "top_priorities": ["short priority 1", "short priority 2", "short priority 3"]
 }
@@ -763,21 +763,25 @@ Hard rules:
 - Only cite numbers YOU WERE GIVEN in the input. If a number is 0, that's a real observation — don't extrapolate.
 - If no top open incidents were listed, say "no notable open incidents" — DO NOT invent incident titles.
 - If no signatures were listed, say "no signature patterns to highlight" — DO NOT invent signature names.
-- Never claim "no alerts today" unless the input actually shows alerts_last_24h=0.
+- Use the exact window phrase provided (e.g. "in the last 6 hours"). Do NOT default to "24 hours".
 - Keep it factual and terse. This is scanned in seconds, not read carefully."""
 
 
 def dashboard_briefing(stats):
-    """stats: {alerts_last_24h, open_incidents_total, incidents_closed_tp_24h,
-    incidents_closed_fp_24h, top_open_incidents:[{title,severity}], top_signatures:[{name,count}]}"""
+    """stats: {window_label, window_from, window_to, alerts_in_window,
+    open_incidents_total, incidents_closed_tp_in_window,
+    incidents_closed_fp_in_window, top_open_incidents:[{title,severity}],
+    top_signatures:[{name,count}]}"""
     if not stats:
         return {"error": "stats required"}
+    window = stats.get("window_label", "in the last 24 hours")
     lines = []
-    lines.append(f"Alerts fired in last 24 hours: {stats.get('alerts_last_24h', 0)}")
+    lines.append(f"Time window: {window} ({stats.get('window_from','?')} to {stats.get('window_to','?')})")
+    lines.append(f"Alerts fired {window}: {stats.get('alerts_in_window', 0)}")
     lines.append(f"Currently open incidents (all time): {stats.get('open_incidents_total', 0)}")
-    lines.append(f"Incidents closed in last 24 hours: "
-                 f"{stats.get('incidents_closed_tp_24h', 0)} true-positive, "
-                 f"{stats.get('incidents_closed_fp_24h', 0)} false-positive")
+    lines.append(f"Incidents closed {window}: "
+                 f"{stats.get('incidents_closed_tp_in_window', 0)} true-positive, "
+                 f"{stats.get('incidents_closed_fp_in_window', 0)} false-positive")
     if stats.get("top_open_incidents"):
         lines.append("Top open incidents right now (by severity):")
         for i in stats["top_open_incidents"][:5]:
@@ -785,12 +789,12 @@ def dashboard_briefing(stats):
     else:
         lines.append("Top open incidents right now: none")
     if stats.get("top_signatures"):
-        lines.append("Top signatures firing in last 24 hours:")
+        lines.append(f"Top signatures firing {window}:")
         for s in stats["top_signatures"][:5]:
             lines.append(f"  - {s.get('name', '')[:80]} ({s.get('count', 0)} times)")
     else:
         lines.append("Top signatures firing: none in the window")
-    prompt = "\n".join(lines) + "\n\nWrite the situation report as JSON per the schema."
+    prompt = "\n".join(lines) + "\n\nWrite the situation report as JSON per the schema. Use the exact window phrase in your recent_activity field."
     r = _call_ollama(prompt, system_prompt=_DASH_BRIEFING_SYSTEM, num_predict=400,
                      feature="dashboard_briefing", audit_input=stats)
     if "error" not in r:
@@ -1163,18 +1167,28 @@ def bulk_triage_suggestion(cluster_stats):
 
 # ── Alert cluster story: what does this cluster mean? ──
 _ALERT_CLUSTER_STORY_SYSTEM = """You explain to a SOC analyst what a cluster of related alerts appears to represent.
-Given the cluster's signature, endpoints, and timing, respond in JSON:
+You are given: the signature, endpoint/port/timing aggregates, the top few actual source/destination IPs,
+prior verdict history for the signature (if any), and whether the top destination IPs are registered / critical assets.
+Respond in JSON:
 {
-  "story": "2-3 sentence plain-English description of what this pattern suggests",
-  "likely_cause": "one sentence best-guess cause (scanner, misconfigured device, legitimate scan, C2 beacon, etc.)",
-  "what_to_check_next": "one concrete verification step"
+  "story": "2-3 sentence plain-English description of what this pattern suggests. Cite specific IPs when the input lists them.",
+  "likely_cause": "one sentence best-guess cause (scanner, misconfigured device, legitimate scan, C2 beacon, etc.) — anchor it to the prior TP/FP history if given.",
+  "what_to_check_next": "one concrete verification step, referencing a specific top IP or the critical asset if applicable"
 }
-Ground your explanation in the specific IPs / ports / timing. Do not invent details."""
+
+Rules:
+- Only reference IPs / SIDs / ports that appear in the input. Do NOT invent IPs.
+- If prior TP % is high, lean toward true-positive framing. If prior FP % is high, lean toward legitimate/misconfig framing.
+- If a top destination is marked business_critical, mention it explicitly in what_to_check_next.
+- Do NOT invent numbers or timestamps."""
 
 
 def alert_cluster_story(cluster):
-    """cluster: {signature, sid, count, first_seen, last_seen, unique_src_ips,
-                 unique_dst_ips, common_dst_port, span_minutes}"""
+    """cluster (enriched): {signature, sid, count, first_seen, last_seen,
+                 span_minutes, unique_src_ips, unique_dst_ips, common_dst_port,
+                 top_src_ips:[...], top_dst_ips:[...],
+                 prior_verdicts_total, prior_tp_pct, prior_fp_pct,
+                 registered_dst_assets, critical_dst_assets}"""
     lines = [
         f"Signature: {cluster.get('signature','?')} (sid={cluster.get('sid','?')})",
         f"Alerts in cluster: {cluster.get('count',0)}",
@@ -1185,8 +1199,26 @@ def alert_cluster_story(cluster):
         f"Unique destination IPs: {cluster.get('unique_dst_ips',0)}",
         f"Most common destination port: {cluster.get('common_dst_port','?')}",
     ]
+    if cluster.get("top_src_ips"):
+        lines.append(f"Top source IPs (up to 3): {', '.join(cluster['top_src_ips'])}")
+    if cluster.get("top_dst_ips"):
+        lines.append(f"Top destination IPs (up to 3): {', '.join(cluster['top_dst_ips'])}")
+    v_total = cluster.get("prior_verdicts_total") or 0
+    if v_total:
+        lines.append(
+            f"Prior verdict history for this signature ({v_total} closed): "
+            f"TP={cluster.get('prior_tp_pct',0)}%, FP={cluster.get('prior_fp_pct',0)}%"
+        )
+    else:
+        lines.append("Prior verdict history for this signature: none")
+    reg = cluster.get("registered_dst_assets", 0) or 0
+    crit = cluster.get("critical_dst_assets", 0) or 0
+    if reg or crit:
+        lines.append(f"Registered destination assets among top IPs: {reg} (of which {crit} are business-critical)")
+    else:
+        lines.append("Registered destination assets among top IPs: 0")
     prompt = "\n".join(lines) + "\n\nProduce the cluster-story JSON."
-    r = _call_ollama(prompt, system_prompt=_ALERT_CLUSTER_STORY_SYSTEM, num_predict=250,
+    r = _call_ollama(prompt, system_prompt=_ALERT_CLUSTER_STORY_SYSTEM, num_predict=350,
                      feature="alert_cluster_story", audit_input=cluster)
     if "error" not in r:
         r["_model"] = OLLAMA_MODEL

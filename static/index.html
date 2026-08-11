@@ -1070,11 +1070,22 @@ async function loadDashboard(){
   // AI Dashboard row (Situation Report + Security Health + Anomaly Radar)
   h+=`<div id="aiDashRow" style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px;margin-bottom:12px;">
     <div class="detail-panel" style="padding:12px;border-left:3px solid #8b5cf6;">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap;">
         <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;font-weight:700;">🧠 Situation Report</div>
-        <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiDashBriefing(this)">Generate</button>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <select id="aiSitRepRange" style="font-size:10px;padding:2px 6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:3px;" title="Time window">
+            <option value="60">Last 1h</option>
+            <option value="360">Last 6h</option>
+            <option value="1440" selected>Last 24h</option>
+            <option value="10080">Last 7d</option>
+            <option value="43200">Last 30d</option>
+            <option value="custom">Custom...</option>
+          </select>
+          <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiDashBriefing(this)">Generate</button>
+          <button class="btn btn-sm" style="background:#0ea5e9;color:#fff;border:none;" onclick="openKnowledgeGraph()" title="Interactive graph of assets, incidents, IOCs, and MITRE techniques in the selected window">Graph</button>
+        </div>
       </div>
-      <div id="aiDashBriefingBody" style="font-size:11px;color:var(--text-dim);font-style:italic;">Summary of the last 24 hours — click Generate.</div>
+      <div id="aiDashBriefingBody" style="font-size:11px;color:var(--text-dim);font-style:italic;">Pick a window and click Generate.</div>
     </div>
     <div class="detail-panel" style="padding:12px;border-left:3px solid #10b981;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
@@ -10076,17 +10087,35 @@ async function _showRuleText(sid){
 // ═════════ Session 1 dashboard AI helpers ═════════
 async function _aiDashBriefing(btn){
   const body=document.getElementById('aiDashBriefingBody');
+  const sel=document.getElementById('aiSitRepRange');
+  let url='/api/ai/dashboard-briefing';
+  let rangeLabel='last 24h';
+  if(sel){
+    const v=sel.value;
+    if(v==='custom'){
+      const fromStr=prompt('From (YYYY-MM-DD HH:MM):', new Date(Date.now()-24*3600*1000).toISOString().slice(0,16).replace('T',' '));
+      if(!fromStr) return;
+      const toStr=prompt('To (YYYY-MM-DD HH:MM):', new Date().toISOString().slice(0,16).replace('T',' '));
+      if(!toStr) return;
+      url += '?from='+encodeURIComponent(fromStr.replace(' ','T'))+'&to='+encodeURIComponent(toStr.replace(' ','T'));
+      rangeLabel=fromStr+' → '+toStr;
+    } else if(v && v!=='1440'){
+      url += '?minutes='+encodeURIComponent(v);
+      rangeLabel=sel.options[sel.selectedIndex].text;
+    }
+  }
   btn.disabled=true; const orig=btn.textContent; btn.textContent='Thinking…';
-  body.innerHTML='<span style="color:var(--text-dim);">Generating situation report (15-40s)…</span>';
+  body.innerHTML=`<span style="color:var(--text-dim);">Generating situation report for ${esc(rangeLabel)} (15-40s)…</span>`;
   try{
-    const r=await api('/api/ai/dashboard-briefing');
+    const r=await api(url);
     if(r && !r.error){
       const priorities=(r.top_priorities||[]).map(f=>`<li style="font-size:11px;margin:2px 0;">${esc(f)}</li>`).join('');
-      body.innerHTML=`<div style="font-size:12px;font-weight:700;color:var(--text);margin-bottom:6px;">${esc(r.headline||'')}</div>
-        ${r.recent_activity?`<div style="font-size:11px;color:var(--text);margin-bottom:4px;"><strong>Last 24 hours:</strong> ${esc(r.recent_activity)}</div>`:''}
+      const windowLabel=r._stats?.window_label||rangeLabel;
+      body.innerHTML=`${_aiGroundingBanner(r)}<div style="font-size:12px;font-weight:700;color:var(--text);margin-bottom:6px;">${esc(r.headline||'')}</div>
+        ${r.recent_activity?`<div style="font-size:11px;color:var(--text);margin-bottom:4px;"><strong>${esc(windowLabel.charAt(0).toUpperCase()+windowLabel.slice(1))}:</strong> ${esc(r.recent_activity)}</div>`:''}
         ${r.current_status?`<div style="font-size:11px;color:var(--text);margin-bottom:6px;"><strong>Right now:</strong> ${esc(r.current_status)}</div>`:''}
         ${priorities?`<div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;font-weight:700;margin-bottom:2px;">Top priorities</div><ul style="margin:0;padding-left:16px;">${priorities}</ul>`:''}
-        <div style="font-size:9px;color:var(--text-dim);margin-top:6px;font-style:italic;">Model: ${esc(r._model||'?')}</div>`;
+        ${_aiRenderModelFooter(r)}`;
     } else {
       body.innerHTML=`<span style="color:var(--critical);">AI unavailable: ${esc(r?.error||'unknown')}</span>`;
     }
@@ -10251,6 +10280,99 @@ function _aiRenderBullets(items){
     items.map(x=>'<li style="margin:2px 0;">'+esc(typeof x==='string'?x:JSON.stringify(x))+'</li>').join('')+
     '</ul>';
 }
+// ── Knowledge Graph modal ────────────────────────────────────────────
+async function openKnowledgeGraph(){
+  const sel=document.getElementById('aiSitRepRange');
+  let qs='';
+  let label='last 24h';
+  if(sel){
+    const v=sel.value;
+    if(v==='custom'){
+      const fromStr=prompt('From (YYYY-MM-DD HH:MM):', new Date(Date.now()-24*3600*1000).toISOString().slice(0,16).replace('T',' '));
+      if(!fromStr) return;
+      const toStr=prompt('To (YYYY-MM-DD HH:MM):', new Date().toISOString().slice(0,16).replace('T',' '));
+      if(!toStr) return;
+      qs='?from='+encodeURIComponent(fromStr.replace(' ','T'))+'&to='+encodeURIComponent(toStr.replace(' ','T'));
+      label=fromStr+' → '+toStr;
+    } else if(v && v!=='1440'){
+      qs='?minutes='+encodeURIComponent(v);
+      label=sel.options[sel.selectedIndex].text;
+    }
+  }
+  const overlay=document.createElement('div');
+  overlay.className='modal-overlay';
+  overlay.onclick=e=>{if(e.target===overlay)overlay.remove();};
+  overlay.innerHTML=`<div class="modal" style="max-width:1000px;width:95vw;max-height:92vh;overflow:hidden;display:flex;flex-direction:column;">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+      <h2 style="margin:0;">🧠 Knowledge Graph — ${esc(label)}</h2>
+      <span id="kgStats" style="font-size:11px;color:var(--text-dim);"></span>
+    </div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px;">Nodes: assets · incidents · signatures · IOCs · MITRE techniques. Drag to reposition, hover for details.</div>
+    <div id="kgViz" style="flex:1;min-height:500px;border:1px solid var(--border);border-radius:6px;background:var(--bg);position:relative;overflow:hidden;">
+      <div style="text-align:center;padding:60px;color:var(--text-dim);font-size:11px;">Loading graph…</div>
+    </div>
+    <div class="actions" style="margin-top:10px;text-align:right;">
+      <button class="btn" onclick="this.closest('.modal-overlay').remove()">Close</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+
+  try{
+    const g=await api('/api/graph/knowledge'+qs);
+    if(!g||g.error){
+      document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:var(--critical);text-align:center;font-size:11px;">${esc(g?.error||'failed to load')}</div>`;
+      return;
+    }
+    const s=g.stats||{};
+    document.getElementById('kgStats').textContent=`${s.node_count||0} nodes · ${s.edge_count||0} edges — ${Object.entries(s.by_type||{}).map(([k,v])=>`${v} ${k}`).join(', ')}`;
+    _kgRender(g);
+  }catch(e){
+    document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:var(--critical);text-align:center;font-size:11px;">${esc(String(e))}</div>`;
+  }
+}
+
+function _kgRender(g){
+  const container=document.getElementById('kgViz');
+  container.innerHTML='';
+  const w=container.clientWidth, h=Math.max(500, container.clientHeight);
+  if(typeof d3==='undefined'){
+    container.innerHTML='<div style="padding:40px;color:var(--critical);text-align:center;font-size:11px;">D3 not loaded — graph cannot render</div>';
+    return;
+  }
+  const colorMap={asset:'#3b82f6', incident:'#dc2626', signature:'#f59e0b', ioc:'#8b5cf6', technique:'#10b981'};
+  const svg=d3.select(container).append('svg').attr('width',w).attr('height',h);
+  const link=svg.append('g').attr('stroke','#666').attr('stroke-opacity',0.4).selectAll('line')
+    .data(g.edges).join('line').attr('stroke-width',d=>Math.max(1,Math.min(6,Math.log2((d.weight||1)+1))));
+  const node=svg.append('g').selectAll('g').data(g.nodes).join('g').call(
+    d3.drag()
+      .on('start',(ev,d)=>{if(!ev.active)sim.alphaTarget(0.3).restart();d.fx=d.x;d.fy=d.y;})
+      .on('drag',(ev,d)=>{d.fx=ev.x;d.fy=ev.y;})
+      .on('end',(ev,d)=>{if(!ev.active)sim.alphaTarget(0);d.fx=null;d.fy=null;})
+  );
+  node.append('circle').attr('r',d=>d.type==='incident'?9:d.type==='asset'?7:5)
+    .attr('fill',d=>colorMap[d.type]||'#999')
+    .attr('stroke','#111').attr('stroke-width',1)
+    .append('title').text(d=>`${d.type}: ${d.label}\n${JSON.stringify(d.meta,null,2)}`);
+  node.append('text').text(d=>d.label.slice(0,25)).attr('x',10).attr('y',4)
+    .style('font-size','10px').style('fill','var(--text)').style('pointer-events','none');
+  const sim=d3.forceSimulation(g.nodes)
+    .force('link',d3.forceLink(g.edges).id(d=>d.id).distance(60).strength(0.5))
+    .force('charge',d3.forceManyBody().strength(-180))
+    .force('center',d3.forceCenter(w/2,h/2))
+    .force('collide',d3.forceCollide(20))
+    .on('tick',()=>{
+      link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
+      node.attr('transform',d=>`translate(${d.x},${d.y})`);
+    });
+
+  // Legend
+  const legend=svg.append('g').attr('transform','translate(10,10)');
+  Object.entries(colorMap).forEach(([type,col],i)=>{
+    legend.append('circle').attr('cx',5).attr('cy',5+i*16).attr('r',5).attr('fill',col);
+    legend.append('text').attr('x',15).attr('y',9+i*16).text(type).style('font-size','10px').style('fill','var(--text)');
+  });
+}
+
 function _aiRenderModelFooter(r){
   const bits=[];
   if(r._model) bits.push('Model: '+esc(r._model));
