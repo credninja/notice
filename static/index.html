@@ -10238,7 +10238,7 @@ async function _aiOpenModal(title, url, body, renderFn){
       bodyEl.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">${esc(r?.error||'unknown')}</div>`;
       return;
     }
-    bodyEl.innerHTML=renderFn(r);
+    bodyEl.innerHTML=_aiGroundingBanner(r)+renderFn(r);
   }catch(e){
     const bodyEl=document.getElementById('aiSession2Body');
     if(bodyEl) bodyEl.innerHTML=`<div style="color:var(--critical);font-size:11px;padding:8px;">${esc(String(e))}</div>`;
@@ -10252,7 +10252,21 @@ function _aiRenderBullets(items){
     '</ul>';
 }
 function _aiRenderModelFooter(r){
-  return r._model?`<div style="font-size:9px;color:var(--text-dim);margin-top:8px;font-style:italic;">Model: ${esc(r._model)}</div>`:'';
+  const bits=[];
+  if(r._model) bits.push('Model: '+esc(r._model));
+  if(r._prompt_version) bits.push('Prompt v'+esc(r._prompt_version));
+  if(r._seed!==undefined) bits.push('Seed '+esc(r._seed));
+  return bits.length?`<div style="font-size:9px;color:var(--text-dim);margin-top:8px;font-style:italic;">${bits.join(' · ')}</div>`:'';
+}
+
+// Yellow banner shown when the LLM output mentions IPs/domains/sids that
+// were not in the provided input — i.e. potential hallucinations.
+function _aiGroundingBanner(r){
+  const ug=r&&r._ungrounded_tokens;
+  if(!ug||!ug.length) return '';
+  return `<div style="padding:6px 10px;background:rgba(245,158,11,.15);border-left:3px solid #f59e0b;border-radius:4px;font-size:10px;margin-bottom:8px;">
+    <strong>⚠ Unverified tokens:</strong> the AI mentioned <span class="mono">${ug.map(esc).join(', ')}</span> which weren't in the input we gave it. Treat these claims with extra skepticism.
+  </div>`;
 }
 
 // ── Feature launchers ────────────────────────────────────────────────

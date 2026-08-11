@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ACME Corp — Employee Portal</title>
+  <style>
+    body { font-family: sans-serif; max-width: 400px; margin: 80px auto; }
+    input { display:block; width:100%; padding:8px; margin:8px 0; }
+    button { padding:8px 16px; background:#3b82f6; color:#fff; border:none; cursor:pointer; }
+    h2 { color:#111; }
+    .note { color:#666; font-size:12px; margin-top:16px; }
+  </style>
+</head>
+<body>
+  <h2>ACME Employee Portal</h2>
+  <form action="/login" method="POST">
+    <input name="user" placeholder="Username" />
+    <input name="pass" placeholder="Password" type="password" />
+    <button type="submit">Sign in</button>
+  </form>
+  <p class="note">Authorized users only. All activity is monitored.</p>
+</body>
+</html>

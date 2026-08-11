@@ -457,6 +457,30 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
 
+-- Per-LLM-call audit record. Populated by analyzers.llm_assistant._call_ollama.
+-- Enables answering "why did the AI say this?" for any past AI response.
+CREATE TABLE IF NOT EXISTS ai_generations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    feature TEXT,              -- e.g. 'alert_cluster_story', 'dashboard_briefing'
+    user_id INTEGER,
+    username TEXT,
+    model TEXT NOT NULL,
+    prompt_version TEXT,       -- SHA1[:12] of the system prompt string
+    seed INTEGER,              -- deterministic seed derived from the input
+    temperature REAL,
+    input_tokens_est INTEGER,
+    output_tokens_est INTEGER,
+    input_json TEXT,           -- JSON blob of the assembled prompt inputs
+    output_json TEXT,          -- JSON blob of the parsed LLM response
+    ungrounded_tokens TEXT,    -- JSON list of IPs/sids/domains in output NOT in input
+    latency_ms INTEGER,
+    error TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ai_gen_created ON ai_generations(created_at);
+CREATE INDEX IF NOT EXISTS idx_ai_gen_feature ON ai_generations(feature);
+CREATE INDEX IF NOT EXISTS idx_ai_gen_user ON ai_generations(user_id);
+
 CREATE TABLE IF NOT EXISTS pipeline_state (
     source TEXT PRIMARY KEY,
     byte_offset INTEGER DEFAULT 0,

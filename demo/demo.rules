@@ -1,0 +1,30 @@
+# ═══════════════════════════════════════════════════════════════════════
+# NOTICE demo rules — fires reliably on the management-demo attack scenario
+# (10.2.139.119 → 10.1.96.53), regardless of HOME_NET boundaries.
+#
+# Install:
+#   sudo cp demo.rules /var/lib/suricata/rules/notice-demo.rules
+#   Add to /etc/suricata/suricata.yaml under rule-files:
+#     - /var/lib/suricata/rules/notice-demo.rules
+#   sudo kill -USR2 $(pgrep -f suricata)
+#
+# Uninstall (after demo):
+#   Remove the include line, delete the file, USR2.
+# ═══════════════════════════════════════════════════════════════════════
+
+# Stage 1 — Recon: many TCP SYN packets from one source in 30 seconds
+alert tcp any any -> any any (msg:"NOTICE DEMO Stage 1 — TCP port scan (SYN burst)"; flags:S; threshold:type threshold, track by_src, count 15, seconds 30; classtype:attempted-recon; priority:2; sid:5900001; rev:1;)
+
+# Stage 2 — Brute force: repeated SSH connection attempts from one source
+alert tcp any any -> any 22 (msg:"NOTICE DEMO Stage 2 — SSH brute-force attempt"; flags:S; threshold:type threshold, track by_src, count 5, seconds 60; classtype:attempted-user; priority:1; sid:5900002; rev:1;)
+
+# Stage 3a — Web attack: path traversal in HTTP request line
+# (Uses raw tcp content match so it fires regardless of what port the web
+#  server listens on — Suricata's HTTP app-layer only parses port 80 by default.)
+alert tcp any any -> any any (msg:"NOTICE DEMO Stage 3 — Path traversal attempt"; flow:established,to_server; content:"GET "; depth:4; content:"../"; distance:0; classtype:web-application-attack; priority:1; sid:5900003; rev:2;)
+
+# Stage 3b — Web attack: SQL injection pattern in HTTP request line
+alert tcp any any -> any any (msg:"NOTICE DEMO Stage 3 — SQL injection attempt"; flow:established,to_server; content:"GET "; depth:4; content:"' OR "; distance:0; nocase; classtype:web-application-attack; priority:1; sid:5900004; rev:2;)
+
+# Stage 3c — Attacker tool fingerprint (sqlmap User-Agent)
+alert tcp any any -> any any (msg:"NOTICE DEMO Stage 3 — Attacker tool detected (sqlmap User-Agent)"; flow:established,to_server; content:"User-Agent|3a| sqlmap"; nocase; classtype:web-application-attack; priority:1; sid:5900005; rev:2;)

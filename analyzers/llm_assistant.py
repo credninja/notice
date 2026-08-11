@@ -14,8 +14,11 @@ Configuration via env vars:
     OLLAMA_TIMEOUT  — default 60 (seconds)
 """
 
+import hashlib
 import json
 import os
+import re
+import time
 import urllib.request
 import urllib.error
 from db import get_db
@@ -28,6 +31,101 @@ OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
 # own default of 5m but is bumped to 30m so a SOC session that clicks the AI
 # every few minutes never hits a cold load.
 OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
+
+
+# ── Reproducibility / grounding / audit-trail helpers ────────────────────
+
+def _prompt_version(system_prompt):
+    """Short stable hash of the system prompt string. If the prompt is
+    edited even by a character, this version changes so we can tell
+    which prompt generated any past audit row."""
+    return hashlib.sha1((system_prompt or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _stable_seed(payload_dict):
+    """Deterministic non-negative int derived from the input payload. Same
+    input → same seed → same LLM output (given fixed model + temperature).
+    Not cryptographically strong; the model uses it as an RNG seed only."""
+    try:
+        blob = json.dumps(payload_dict, sort_keys=True, default=str)
+    except Exception:
+        blob = str(payload_dict)
+    h = hashlib.sha1(blob.encode("utf-8")).hexdigest()
+    return int(h[:8], 16)  # 32-bit int, always positive
+
+
+# Token extraction — used both for coarse token-count estimates and for
+# grounding validation.
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_DOMAIN_RE = re.compile(r"\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\b", re.I)
+_SID_RE = re.compile(r"\bsid[:= ]*(\d{3,10})\b|\b(?<![.\d])(\d{6,10})(?![.\d])\b", re.I)
+
+
+def _extract_tokens(text):
+    """Pull IPs, domains, sids out of a text blob (or dict).
+    Returns a set of lowercased strings."""
+    if isinstance(text, dict):
+        text = json.dumps(text, default=str)
+    elif not isinstance(text, str):
+        text = str(text)
+    tokens = set()
+    for ip in _IPV4_RE.findall(text):
+        tokens.add(ip)
+    for dom in _DOMAIN_RE.findall(text):
+        # Skip pure IPs (already caught above) and words like "1.2" that look like domains
+        if "." in dom and not _IPV4_RE.fullmatch(dom):
+            tokens.add(dom.lower())
+    for m in _SID_RE.finditer(text):
+        sid = m.group(1) or m.group(2)
+        if sid:
+            tokens.add(sid)
+    return tokens
+
+
+def _estimate_tokens(text):
+    """Rough token count: ~4 chars per token for English (Qwen tokenizer's
+    empirical average). Good enough for audit-log budgeting."""
+    if not text:
+        return 0
+    if isinstance(text, dict):
+        text = json.dumps(text, default=str)
+    return max(1, len(str(text)) // 4)
+
+
+def _ungrounded_tokens(input_payload, output_payload):
+    """Tokens (IPs / sids / domains) that appear in the LLM output but were
+    NOT provided in the input. These are the model's inventions.
+    Returns a sorted list."""
+    input_toks = _extract_tokens(input_payload)
+    output_toks = _extract_tokens(output_payload)
+    return sorted(output_toks - input_toks)
+
+
+def _log_ai_call(feature, model, prompt_version, seed, temperature,
+                 input_payload, output_payload, input_tokens, output_tokens,
+                 ungrounded, latency_ms, error=""):
+    """Best-effort audit-log insert. Never raises — audit failure must not
+    break the caller's response."""
+    try:
+        conn = get_db()
+        conn.execute(
+            """INSERT INTO ai_generations
+               (feature, model, prompt_version, seed, temperature,
+                input_tokens_est, output_tokens_est,
+                input_json, output_json, ungrounded_tokens, latency_ms, error)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (feature, model, prompt_version, seed, temperature,
+             input_tokens, output_tokens,
+             json.dumps(input_payload, default=str)[:20000],
+             json.dumps(output_payload, default=str)[:20000],
+             json.dumps(ungrounded)[:4000] if ungrounded else "[]",
+             latency_ms, error or "")
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        # Audit failure is silent — never break the actual AI response.
+        pass
 
 
 SYSTEM_PROMPT = """You are a senior SOC analyst assistant. Given an incident and its context,
@@ -213,14 +311,37 @@ def _build_user_prompt(ctx):
 
 
 def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT,
-                 json_mode=True, num_predict=400, temperature=0.2):
+                 json_mode=True, num_predict=400, temperature=0.2,
+                 feature=None, audit_input=None):
     """POST to Ollama /api/chat. If json_mode=True, forces + parses JSON.
     If json_mode=False, returns {"text": <plain text>}.
 
-    Retries on transient network errors and on malformed-JSON responses —
-    when json_mode is on the model occasionally emits stray text around the
-    JSON block, so we salvage or retry once before returning the error.
+    Retries on transient network errors and on malformed-JSON responses.
+
+    Reproducibility + audit trail:
+      - `feature` — short slug (e.g. 'alert_cluster_story'); used to
+        label the audit row and to derive the seed. If not passed, the
+        caller function's name is used automatically.
+      - `audit_input` — dict of the assembled prompt inputs. Determines
+        the deterministic seed AND is persisted verbatim in the audit
+        table so any past AI response can be re-derived.
+      - Prompt version = SHA1[:12] of the system prompt.
+      - Every attempt (successful or not) writes exactly one row to
+        `ai_generations`.
     """
+    if feature is None:
+        try:
+            import sys as _sys
+            feature = _sys._getframe(1).f_code.co_name
+        except Exception:
+            feature = "unknown"
+    prompt_version = _prompt_version(system_prompt)
+    # Seed derivation: prefer audit_input, fall back to the composed prompt
+    # so a call without an audit_input still gets *some* determinism.
+    seed = _stable_seed(audit_input if audit_input is not None
+                        else {"system": system_prompt, "user": user_prompt,
+                              "num_predict": num_predict, "temperature": temperature})
+
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
@@ -232,6 +353,7 @@ def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT,
         "options": {
             "temperature": temperature,
             "num_predict": num_predict,
+            "seed": seed,
         },
     }
     if json_mode:
@@ -247,6 +369,43 @@ def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT,
         with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
             return json.loads(resp.read().decode())
 
+    input_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
+    t_start = time.time()
+
+    def _finalize(result, error=""):
+        """Compute grounding + latency + audit-log, then return result."""
+        latency_ms = int((time.time() - t_start) * 1000)
+        output_tokens = _estimate_tokens(result if isinstance(result, dict) else str(result))
+        # Grounding check: only against structured payloads (skip on error)
+        ungrounded = []
+        if audit_input is not None and isinstance(result, dict) and "error" not in result:
+            try:
+                ungrounded = _ungrounded_tokens(audit_input, result)
+            except Exception:
+                ungrounded = []
+        _log_ai_call(
+            feature=feature or "unknown",
+            model=OLLAMA_MODEL,
+            prompt_version=prompt_version,
+            seed=seed,
+            temperature=temperature,
+            input_payload=audit_input if audit_input is not None
+                          else {"user_prompt": user_prompt[:2000]},
+            output_payload=result,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            ungrounded=ungrounded,
+            latency_ms=latency_ms,
+            error=error,
+        )
+        # Surface grounding warnings on successful responses so the UI can flag them
+        if ungrounded and isinstance(result, dict) and "error" not in result:
+            result["_ungrounded_tokens"] = ungrounded
+        if isinstance(result, dict):
+            result["_prompt_version"] = prompt_version
+            result["_seed"] = seed
+        return result
+
     # ── Attempt with one retry on transient failure ──
     last_net_err = None
     body = None
@@ -256,29 +415,28 @@ def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT,
             break
         except (urllib.error.URLError, TimeoutError) as e:
             last_net_err = e
-            # brief backoff before retry
-            import time as _t; _t.sleep(0.5)
+            time.sleep(0.5)
         except Exception as e:
-            return {"error": f"Ollama call failed: {e}"}
+            return _finalize({"error": f"Ollama call failed: {e}"}, error=str(e))
     if body is None:
-        return {"error": f"Ollama unreachable at {OLLAMA_HOST}: {last_net_err}"}
+        return _finalize({"error": f"Ollama unreachable at {OLLAMA_HOST}: {last_net_err}"},
+                         error=str(last_net_err))
 
     content = ((body.get("message") or {}).get("content") or "").strip()
     if not content:
-        return {"error": "Empty response from LLM"}
+        return _finalize({"error": "Empty response from LLM"}, error="empty")
     if not json_mode:
-        return {"text": content}
+        return _finalize({"text": content})
 
     # ── JSON parse with salvage + one retry ──
     try:
-        return json.loads(content)
+        return _finalize(json.loads(content))
     except json.JSONDecodeError:
         pass
-    # Salvage: pull the biggest {...} substring
     salvaged = _extract_json_block(content)
     if salvaged is not None:
         try:
-            return json.loads(salvaged)
+            return _finalize(json.loads(salvaged))
         except json.JSONDecodeError:
             pass
     # Retry once — usually clears transient malformed output
@@ -287,17 +445,19 @@ def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT,
         content2 = ((body2.get("message") or {}).get("content") or "").strip()
         if content2:
             try:
-                return json.loads(content2)
+                return _finalize(json.loads(content2))
             except json.JSONDecodeError:
                 salvaged2 = _extract_json_block(content2)
                 if salvaged2 is not None:
                     try:
-                        return json.loads(salvaged2)
+                        return _finalize(json.loads(salvaged2))
                     except json.JSONDecodeError:
                         pass
     except Exception:
         pass
-    return {"error": "LLM returned non-JSON output (after retry)", "raw": content[:500]}
+    return _finalize(
+        {"error": "LLM returned non-JSON output (after retry)", "raw": content[:500]},
+        error="non-json")
 
 
 def _extract_json_block(text):
@@ -631,7 +791,8 @@ def dashboard_briefing(stats):
     else:
         lines.append("Top signatures firing: none in the window")
     prompt = "\n".join(lines) + "\n\nWrite the situation report as JSON per the schema."
-    r = _call_ollama(prompt, system_prompt=_DASH_BRIEFING_SYSTEM, num_predict=400)
+    r = _call_ollama(prompt, system_prompt=_DASH_BRIEFING_SYSTEM, num_predict=400,
+                     feature="dashboard_briefing", audit_input=stats)
     if "error" not in r:
         r["_model"] = OLLAMA_MODEL
     return r
@@ -1025,7 +1186,8 @@ def alert_cluster_story(cluster):
         f"Most common destination port: {cluster.get('common_dst_port','?')}",
     ]
     prompt = "\n".join(lines) + "\n\nProduce the cluster-story JSON."
-    r = _call_ollama(prompt, system_prompt=_ALERT_CLUSTER_STORY_SYSTEM, num_predict=250)
+    r = _call_ollama(prompt, system_prompt=_ALERT_CLUSTER_STORY_SYSTEM, num_predict=250,
+                     feature="alert_cluster_story", audit_input=cluster)
     if "error" not in r:
         r["_model"] = OLLAMA_MODEL
     return r
