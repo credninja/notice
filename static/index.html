@@ -10093,12 +10093,10 @@ async function _aiDashBriefing(btn){
   if(sel){
     const v=sel.value;
     if(v==='custom'){
-      const fromStr=prompt('From (YYYY-MM-DD HH:MM):', new Date(Date.now()-24*3600*1000).toISOString().slice(0,16).replace('T',' '));
-      if(!fromStr) return;
-      const toStr=prompt('To (YYYY-MM-DD HH:MM):', new Date().toISOString().slice(0,16).replace('T',' '));
-      if(!toStr) return;
-      url += '?from='+encodeURIComponent(fromStr.replace(' ','T'))+'&to='+encodeURIComponent(toStr.replace(' ','T'));
-      rangeLabel=fromStr+' → '+toStr;
+      const rng=await pickCustomRange(1);
+      if(!rng) return;
+      url += '?from='+encodeURIComponent(rng.from)+'&to='+encodeURIComponent(rng.to);
+      rangeLabel=rng.label;
     } else if(v && v!=='1440'){
       url += '?minutes='+encodeURIComponent(v);
       rangeLabel=sel.options[sel.selectedIndex].text;
@@ -10280,6 +10278,47 @@ function _aiRenderBullets(items){
     items.map(x=>'<li style="margin:2px 0;">'+esc(typeof x==='string'?x:JSON.stringify(x))+'</li>').join('')+
     '</ul>';
 }
+// ── Shared custom time-range picker ─────────────────────────────────
+// Returns a Promise resolving to {minutes, from, to, label} or null if user cancels.
+// Uses two datetime-local inputs in a small modal.
+function pickCustomRange(defaultDaysBack){
+  return new Promise(resolve=>{
+    const dfltDays=defaultDaysBack||1;
+    const now=new Date();
+    const past=new Date(now.getTime() - dfltDays*24*3600*1000);
+    const fmt=d=>{
+      const pad=n=>String(n).padStart(2,'0');
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    };
+    const overlay=document.createElement('div');
+    overlay.className='modal-overlay';
+    overlay.onclick=e=>{if(e.target===overlay){overlay.remove();resolve(null);}};
+    overlay.innerHTML=`<div class="modal" style="max-width:420px;">
+      <h2 style="margin:0 0 10px;font-size:14px;">Custom time range</h2>
+      <div style="display:flex;flex-direction:column;gap:8px;font-size:12px;">
+        <label>From: <input type="datetime-local" id="pickFrom" value="${fmt(past)}" style="width:100%;padding:6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:3px;"></label>
+        <label>To: <input type="datetime-local" id="pickTo" value="${fmt(now)}" style="width:100%;padding:6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:3px;"></label>
+      </div>
+      <div class="actions" style="margin-top:14px;display:flex;justify-content:flex-end;gap:6px;">
+        <button class="btn" id="pickCancel">Cancel</button>
+        <button class="btn btn-primary" id="pickOK">Use range</button>
+      </div>
+    </div>`;
+    document.body.appendChild(overlay);
+    document.getElementById('pickCancel').onclick=()=>{overlay.remove();resolve(null);};
+    document.getElementById('pickOK').onclick=()=>{
+      const f=document.getElementById('pickFrom').value;
+      const t=document.getElementById('pickTo').value;
+      if(!f||!t){showToast('Both from and to are required','warning');return;}
+      if(new Date(f)>=new Date(t)){showToast('From must be before To','warning');return;}
+      overlay.remove();
+      const label=`${f.replace('T',' ')} → ${t.replace('T',' ')}`;
+      resolve({from:f, to:t, label});
+    };
+    setTimeout(()=>document.getElementById('pickFrom').focus(),50);
+  });
+}
+
 // ── Knowledge Graph modal ────────────────────────────────────────────
 async function openKnowledgeGraph(){
   const sel=document.getElementById('aiSitRepRange');
@@ -10288,12 +10327,10 @@ async function openKnowledgeGraph(){
   if(sel){
     const v=sel.value;
     if(v==='custom'){
-      const fromStr=prompt('From (YYYY-MM-DD HH:MM):', new Date(Date.now()-24*3600*1000).toISOString().slice(0,16).replace('T',' '));
-      if(!fromStr) return;
-      const toStr=prompt('To (YYYY-MM-DD HH:MM):', new Date().toISOString().slice(0,16).replace('T',' '));
-      if(!toStr) return;
-      qs='?from='+encodeURIComponent(fromStr.replace(' ','T'))+'&to='+encodeURIComponent(toStr.replace(' ','T'));
-      label=fromStr+' → '+toStr;
+      const rng=await pickCustomRange(1);
+      if(!rng) return;
+      qs='?from='+encodeURIComponent(rng.from)+'&to='+encodeURIComponent(rng.to);
+      label=rng.label;
     } else if(v && v!=='1440'){
       qs='?minutes='+encodeURIComponent(v);
       label=sel.options[sel.selectedIndex].text;
@@ -10302,14 +10339,14 @@ async function openKnowledgeGraph(){
   const overlay=document.createElement('div');
   overlay.className='modal-overlay';
   overlay.onclick=e=>{if(e.target===overlay)overlay.remove();};
-  overlay.innerHTML=`<div class="modal" style="max-width:1000px;width:95vw;max-height:92vh;overflow:hidden;display:flex;flex-direction:column;">
+  overlay.innerHTML=`<div class="modal" style="max-width:1100px;width:95vw;height:90vh;overflow:hidden;display:flex;flex-direction:column;">
     <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
       <h2 style="margin:0;">🧠 Knowledge Graph — ${esc(label)}</h2>
       <span id="kgStats" style="font-size:11px;color:var(--text-dim);"></span>
     </div>
     <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px;">Nodes: assets · incidents · signatures · IOCs · MITRE techniques. Drag to reposition, hover for details.</div>
-    <div id="kgViz" style="flex:1;min-height:500px;border:1px solid var(--border);border-radius:6px;background:var(--bg);position:relative;overflow:hidden;">
-      <div style="text-align:center;padding:60px;color:var(--text-dim);font-size:11px;">Loading graph…</div>
+    <div id="kgViz" style="flex:1;min-height:520px;height:520px;border:1px solid var(--border);border-radius:6px;background:#0b1220;position:relative;overflow:hidden;">
+      <div style="text-align:center;padding:60px;color:#94a3b8;font-size:11px;">Loading graph…</div>
     </div>
     <div class="actions" style="margin-top:10px;text-align:right;">
       <button class="btn" onclick="this.closest('.modal-overlay').remove()">Close</button>
@@ -10320,56 +10357,79 @@ async function openKnowledgeGraph(){
   try{
     const g=await api('/api/graph/knowledge'+qs);
     if(!g||g.error){
-      document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:var(--critical);text-align:center;font-size:11px;">${esc(g?.error||'failed to load')}</div>`;
+      document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:#ef4444;text-align:center;font-size:11px;">${esc(g?.error||'failed to load')}</div>`;
       return;
     }
     const s=g.stats||{};
     document.getElementById('kgStats').textContent=`${s.node_count||0} nodes · ${s.edge_count||0} edges — ${Object.entries(s.by_type||{}).map(([k,v])=>`${v} ${k}`).join(', ')}`;
-    _kgRender(g);
+    if(!g.nodes || !g.nodes.length){
+      document.getElementById('kgViz').innerHTML=`<div style="padding:60px;text-align:center;color:#94a3b8;font-size:12px;">No incidents or alert traffic in the selected window.<br>Widen the time range and try again.</div>`;
+      return;
+    }
+    // Give the modal one paint tick so the container has real dimensions
+    requestAnimationFrame(()=>_kgRender(g));
   }catch(e){
-    document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:var(--critical);text-align:center;font-size:11px;">${esc(String(e))}</div>`;
+    document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:#ef4444;text-align:center;font-size:11px;">${esc(String(e))}</div>`;
   }
 }
 
 function _kgRender(g){
   const container=document.getElementById('kgViz');
+  if(!container) return;
   container.innerHTML='';
-  const w=container.clientWidth, h=Math.max(500, container.clientHeight);
+  // Fallback dimensions if the container hasn't been laid out yet
+  const w=Math.max(300, container.clientWidth || 900);
+  const h=Math.max(400, container.clientHeight || 520);
   if(typeof d3==='undefined'){
-    container.innerHTML='<div style="padding:40px;color:var(--critical);text-align:center;font-size:11px;">D3 not loaded — graph cannot render</div>';
+    container.innerHTML='<div style="padding:40px;color:#ef4444;text-align:center;font-size:11px;">D3 not loaded — graph cannot render</div>';
     return;
   }
   const colorMap={asset:'#3b82f6', incident:'#dc2626', signature:'#f59e0b', ioc:'#8b5cf6', technique:'#10b981'};
-  const svg=d3.select(container).append('svg').attr('width',w).attr('height',h);
-  const link=svg.append('g').attr('stroke','#666').attr('stroke-opacity',0.4).selectAll('line')
+  const svg=d3.select(container).append('svg').attr('width',w).attr('height',h)
+    .style('display','block');
+  // Zoom/pan wrapper
+  const g_root=svg.append('g');
+  svg.call(d3.zoom().scaleExtent([0.2, 4]).on('zoom', (ev)=>g_root.attr('transform', ev.transform)));
+
+  const link=g_root.append('g').attr('stroke','#94a3b8').attr('stroke-opacity',0.35).selectAll('line')
     .data(g.edges).join('line').attr('stroke-width',d=>Math.max(1,Math.min(6,Math.log2((d.weight||1)+1))));
-  const node=svg.append('g').selectAll('g').data(g.nodes).join('g').call(
-    d3.drag()
+
+  let sim;
+  const node=g_root.append('g').selectAll('g').data(g.nodes).join('g')
+    .style('cursor','grab')
+    .call(d3.drag()
       .on('start',(ev,d)=>{if(!ev.active)sim.alphaTarget(0.3).restart();d.fx=d.x;d.fy=d.y;})
       .on('drag',(ev,d)=>{d.fx=ev.x;d.fy=ev.y;})
       .on('end',(ev,d)=>{if(!ev.active)sim.alphaTarget(0);d.fx=null;d.fy=null;})
-  );
-  node.append('circle').attr('r',d=>d.type==='incident'?9:d.type==='asset'?7:5)
-    .attr('fill',d=>colorMap[d.type]||'#999')
-    .attr('stroke','#111').attr('stroke-width',1)
+    );
+  node.append('circle')
+    .attr('r',d=>d.type==='incident'?9:d.type==='asset'?7:5)
+    .attr('fill',d=>colorMap[d.type]||'#94a3b8')
+    .attr('stroke','#0b1220').attr('stroke-width',1.5)
     .append('title').text(d=>`${d.type}: ${d.label}\n${JSON.stringify(d.meta,null,2)}`);
-  node.append('text').text(d=>d.label.slice(0,25)).attr('x',10).attr('y',4)
-    .style('font-size','10px').style('fill','var(--text)').style('pointer-events','none');
-  const sim=d3.forceSimulation(g.nodes)
-    .force('link',d3.forceLink(g.edges).id(d=>d.id).distance(60).strength(0.5))
-    .force('charge',d3.forceManyBody().strength(-180))
+  node.append('text').text(d=>(d.label||'').slice(0,28))
+    .attr('x',10).attr('y',4)
+    .style('font-size','10px').style('fill','#e2e8f0').style('pointer-events','none')
+    .style('paint-order','stroke').style('stroke','#0b1220').style('stroke-width','3px');
+
+  sim=d3.forceSimulation(g.nodes)
+    .force('link',d3.forceLink(g.edges).id(d=>d.id).distance(80).strength(0.4))
+    .force('charge',d3.forceManyBody().strength(-220))
     .force('center',d3.forceCenter(w/2,h/2))
-    .force('collide',d3.forceCollide(20))
+    .force('collide',d3.forceCollide(24))
     .on('tick',()=>{
       link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
       node.attr('transform',d=>`translate(${d.x},${d.y})`);
     });
 
-  // Legend
-  const legend=svg.append('g').attr('transform','translate(10,10)');
+  // Legend (in-SVG, top-left, non-scaling)
+  const legend=svg.append('g').attr('transform','translate(12,12)');
+  legend.append('rect').attr('width',110).attr('height',Object.keys(colorMap).length*18+8)
+    .attr('fill','#0b1220').attr('stroke','#334155').attr('rx',4);
   Object.entries(colorMap).forEach(([type,col],i)=>{
-    legend.append('circle').attr('cx',5).attr('cy',5+i*16).attr('r',5).attr('fill',col);
-    legend.append('text').attr('x',15).attr('y',9+i*16).text(type).style('font-size','10px').style('fill','var(--text)');
+    legend.append('circle').attr('cx',12).attr('cy',14+i*18).attr('r',5).attr('fill',col);
+    legend.append('text').attr('x',24).attr('y',18+i*18).text(type)
+      .style('font-size','10px').style('fill','#e2e8f0');
   });
 }
 
