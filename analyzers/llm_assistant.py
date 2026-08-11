@@ -22,7 +22,12 @@ from db import get_db
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
-OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "60"))
+OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
+# Keep the model resident in Ollama's RAM for this long between calls, so we
+# don't pay the model-load penalty on every request. Default matches Ollama's
+# own default of 5m but is bumped to 30m so a SOC session that clicks the AI
+# every few minutes never hits a cold load.
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
 
 
 SYSTEM_PROMPT = """You are a senior SOC analyst assistant. Given an incident and its context,
@@ -211,6 +216,10 @@ def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT,
                  json_mode=True, num_predict=400, temperature=0.2):
     """POST to Ollama /api/chat. If json_mode=True, forces + parses JSON.
     If json_mode=False, returns {"text": <plain text>}.
+
+    Retries on transient network errors and on malformed-JSON responses —
+    when json_mode is on the model occasionally emits stray text around the
+    JSON block, so we salvage or retry once before returning the error.
     """
     payload = {
         "model": OLLAMA_MODEL,
@@ -219,6 +228,7 @@ def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT,
             {"role": "user", "content": user_prompt},
         ],
         "stream": False,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "temperature": temperature,
             "num_predict": num_predict,
@@ -226,29 +236,79 @@ def _call_ollama(user_prompt, system_prompt=SYSTEM_PROMPT,
     }
     if json_mode:
         payload["format"] = "json"
-    req = urllib.request.Request(
-        OLLAMA_HOST + "/api/chat",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
+
+    def _do_request():
+        req = urllib.request.Request(
+            OLLAMA_HOST + "/api/chat",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
-            body = json.loads(resp.read().decode())
-    except urllib.error.URLError as e:
-        return {"error": f"Ollama unreachable at {OLLAMA_HOST}: {e}"}
-    except Exception as e:
-        return {"error": f"Ollama call failed: {e}"}
+            return json.loads(resp.read().decode())
+
+    # ── Attempt with one retry on transient failure ──
+    last_net_err = None
+    body = None
+    for attempt in (1, 2):
+        try:
+            body = _do_request()
+            break
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_net_err = e
+            # brief backoff before retry
+            import time as _t; _t.sleep(0.5)
+        except Exception as e:
+            return {"error": f"Ollama call failed: {e}"}
+    if body is None:
+        return {"error": f"Ollama unreachable at {OLLAMA_HOST}: {last_net_err}"}
 
     content = ((body.get("message") or {}).get("content") or "").strip()
     if not content:
         return {"error": "Empty response from LLM"}
     if not json_mode:
         return {"text": content}
+
+    # ── JSON parse with salvage + one retry ──
     try:
         return json.loads(content)
     except json.JSONDecodeError:
-        return {"error": "LLM returned non-JSON output", "raw": content[:500]}
+        pass
+    # Salvage: pull the biggest {...} substring
+    salvaged = _extract_json_block(content)
+    if salvaged is not None:
+        try:
+            return json.loads(salvaged)
+        except json.JSONDecodeError:
+            pass
+    # Retry once — usually clears transient malformed output
+    try:
+        body2 = _do_request()
+        content2 = ((body2.get("message") or {}).get("content") or "").strip()
+        if content2:
+            try:
+                return json.loads(content2)
+            except json.JSONDecodeError:
+                salvaged2 = _extract_json_block(content2)
+                if salvaged2 is not None:
+                    try:
+                        return json.loads(salvaged2)
+                    except json.JSONDecodeError:
+                        pass
+    except Exception:
+        pass
+    return {"error": "LLM returned non-JSON output (after retry)", "raw": content[:500]}
+
+
+def _extract_json_block(text):
+    """Return the substring from the first '{' to the matching final '}'."""
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start:end + 1]
 
 
 # ═══════════════════════════════════════════════════════════════════════
