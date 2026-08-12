@@ -34,7 +34,7 @@
     <div class="nav-dropdown">
       <button class="nav-tab nav-dropdown-trigger">Analysis <span class="nav-caret">&#9662;</span></button>
       <div class="nav-dropdown-menu">
-        <button class="nav-tab" data-page="graph" title="[2] Network Map">Network Map</button>
+        <button class="nav-tab" data-page="graph" title="[2] Traffic Map">Traffic Map</button>
         <button class="nav-tab" data-page="security" title="[3] Alerts">Alerts</button>
         <button class="nav-tab" data-page="investigate" title="[4] IP Investigation">Investigate</button>
         <button class="nav-tab" data-page="anomalies" title="[5] Anomaly Detection">Anomalies</button>
@@ -95,7 +95,7 @@
   <!-- GRAPH PAGE -->
   <div class="page" id="page-graph">
     <div id="graph-mode-tabs" class="sub-tabs">
-      <button class="sub-tab active" data-graph-mode="map" onclick="setGraphMode('map')">Network Map</button>
+      <button class="sub-tab active" data-graph-mode="map" onclick="setGraphMode('map')">Traffic Map</button>
     </div>
     <div id="graph-content">
     <div id="graph-mode-map">
@@ -4972,7 +4972,7 @@ function _renderPhasePanel(d, phase){
     <div style="display:flex;gap:6px;flex-wrap:wrap;">
       ${attacker?`<button class="btn btn-sm" onclick="navigateTo('investigate','${esc(attacker)}')">Investigate Attacker ${esc(attacker)}</button>`:''}
       ${victim?`<button class="btn btn-sm" onclick="navigateTo('investigate','${esc(victim)}')">Investigate Victim ${esc(victim)}</button>`:''}
-      <button class="btn btn-sm" onclick="navigateTo('graph')">Open Network Map</button>
+      <button class="btn btn-sm" onclick="navigateTo('graph')">Open Traffic Map</button>
     </div>`;
   } else if(phase.id==='contain'){
     h+=`<ul style="margin:0 0 10px 18px;font-size:12px;line-height:1.8;">
