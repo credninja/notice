@@ -1079,7 +1079,6 @@ async function loadDashboard(){
             <option value="1440" selected>Last 24h</option>
             <option value="10080">Last 7d</option>
             <option value="43200">Last 30d</option>
-            <option value="custom">Custom...</option>
           </select>
           <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiDashBriefing(this)">Generate</button>
           <button class="btn btn-sm" style="background:#0ea5e9;color:#fff;border:none;" onclick="openKnowledgeGraph()" title="Interactive graph of assets, incidents, IOCs, and MITRE techniques in the selected window">Graph</button>
@@ -10093,12 +10092,7 @@ async function _aiDashBriefing(btn){
   let rangeLabel='last 24h';
   if(sel){
     const v=sel.value;
-    if(v==='custom'){
-      const rng=await pickCustomRange(1);
-      if(!rng) return;
-      url += '?from='+encodeURIComponent(rng.from)+'&to='+encodeURIComponent(rng.to);
-      rangeLabel=rng.label;
-    } else if(v && v!=='1440'){
+    if(v && v!=='1440'){
       url += '?minutes='+encodeURIComponent(v);
       rangeLabel=sel.options[sel.selectedIndex].text;
     }
@@ -10279,47 +10273,6 @@ function _aiRenderBullets(items){
     items.map(x=>'<li style="margin:2px 0;">'+esc(typeof x==='string'?x:JSON.stringify(x))+'</li>').join('')+
     '</ul>';
 }
-// ── Shared custom time-range picker ─────────────────────────────────
-// Returns a Promise resolving to {minutes, from, to, label} or null if user cancels.
-// Uses two datetime-local inputs in a small modal.
-function pickCustomRange(defaultDaysBack){
-  return new Promise(resolve=>{
-    const dfltDays=defaultDaysBack||1;
-    const now=new Date();
-    const past=new Date(now.getTime() - dfltDays*24*3600*1000);
-    const fmt=d=>{
-      const pad=n=>String(n).padStart(2,'0');
-      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    };
-    const overlay=document.createElement('div');
-    overlay.className='modal-overlay';
-    overlay.onclick=e=>{if(e.target===overlay){overlay.remove();resolve(null);}};
-    overlay.innerHTML=`<div class="modal" style="max-width:420px;">
-      <h2 style="margin:0 0 10px;font-size:14px;">Custom time range</h2>
-      <div style="display:flex;flex-direction:column;gap:8px;font-size:12px;">
-        <label>From: <input type="datetime-local" id="pickFrom" value="${fmt(past)}" style="width:100%;padding:6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:3px;"></label>
-        <label>To: <input type="datetime-local" id="pickTo" value="${fmt(now)}" style="width:100%;padding:6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:3px;"></label>
-      </div>
-      <div class="actions" style="margin-top:14px;display:flex;justify-content:flex-end;gap:6px;">
-        <button class="btn" id="pickCancel">Cancel</button>
-        <button class="btn btn-primary" id="pickOK">Use range</button>
-      </div>
-    </div>`;
-    document.body.appendChild(overlay);
-    document.getElementById('pickCancel').onclick=()=>{overlay.remove();resolve(null);};
-    document.getElementById('pickOK').onclick=()=>{
-      const f=document.getElementById('pickFrom').value;
-      const t=document.getElementById('pickTo').value;
-      if(!f||!t){showToast('Both from and to are required','warning');return;}
-      if(new Date(f)>=new Date(t)){showToast('From must be before To','warning');return;}
-      overlay.remove();
-      const label=`${f.replace('T',' ')} → ${t.replace('T',' ')}`;
-      resolve({from:f, to:t, label});
-    };
-    setTimeout(()=>document.getElementById('pickFrom').focus(),50);
-  });
-}
-
 // ── Knowledge Graph modal ────────────────────────────────────────────
 // State for the currently-open graph: nodes, edges, sim, mode, selection, etc.
 window._kg = null;
@@ -10335,12 +10288,7 @@ async function openKnowledgeGraph(){
   let label='last 24h';
   if(sel){
     const v=sel.value;
-    if(v==='custom'){
-      const rng=await pickCustomRange(1);
-      if(!rng) return;
-      qs='?from='+encodeURIComponent(rng.from)+'&to='+encodeURIComponent(rng.to);
-      label=rng.label;
-    } else if(v && v!=='1440'){
+    if(v && v!=='1440'){
       qs='?minutes='+encodeURIComponent(v);
       label=sel.options[sel.selectedIndex].text;
     }
