@@ -102,14 +102,14 @@ def register(app):
         if incident_filter is not None:
             incidents_rows = conn.execute(
                 "SELECT id, title, severity, status, verdict, attacker_ip, "
-                "victim_ip, signature_id, signature, closure_mitre_technique "
+                "victim_ip, signature_id, signature, closure_mitre_technique, created_at "
                 "FROM incidents WHERE id=?",
                 (incident_filter,)
             ).fetchall()
         else:
             incidents_rows = conn.execute(
                 "SELECT id, title, severity, status, verdict, attacker_ip, "
-                "victim_ip, signature_id, signature, closure_mitre_technique "
+                "victim_ip, signature_id, signature, closure_mitre_technique, created_at "
                 "FROM incidents WHERE created_at >= ? AND created_at < ? "
                 "ORDER BY created_at DESC LIMIT ?",
                 (from_str, to_str, max_nodes)
@@ -122,7 +122,9 @@ def register(app):
             _add_node(inc_id, "incident",
                       f"INC-{inc['id']:04d} {(inc['title'] or '')[:40]}",
                       {"severity": inc["severity"], "status": inc["status"],
-                       "verdict": inc["verdict"], "signature_id": inc["signature_id"]})
+                       "verdict": inc["verdict"], "signature_id": inc["signature_id"],
+                       "created_at": inc["created_at"],
+                       "incident_id": inc["id"]})
             # Src/dst IP nodes and edges
             for role, ip in (("attacker", inc["attacker_ip"]), ("victim", inc["victim_ip"])):
                 if not ip:

@@ -4144,6 +4144,7 @@ async function showIncidentDetail(id){
         <button class="btn btn-sm" style="background:#8b5cf6;color:#fff;border:none;" onclick="_aiAnalyze(${d.id},this)">Analyze</button>
         <button class="btn btn-sm" style="background:#6366f1;color:#fff;border:none;" onclick="_aiSimilarInc(${d.id},this)">Similar History</button>
         <button class="btn btn-sm" style="background:#ec4899;color:#fff;border:none;" onclick="aiAutoPromoteReasoning(${d.id})" title="Why was this alert promoted to an incident?">Why Promoted?</button>
+        <button class="btn btn-sm" style="background:#0ea5e9;color:#fff;border:none;" onclick="openKnowledgeGraphForIncident(${d.id})" title="Open the knowledge graph scoped to this incident and its related IPs, IOCs, and techniques">View in Graph</button>
       </div>
     </div>
     <div id="aiAnalysisBody" style="margin-top:8px;"></div>
@@ -10320,6 +10321,14 @@ function pickCustomRange(defaultDaysBack){
 }
 
 // ── Knowledge Graph modal ────────────────────────────────────────────
+// State for the currently-open graph: nodes, edges, sim, mode, selection, etc.
+window._kg = null;
+
+// Opens the graph scoped to a specific incident (invoked from incident-detail button).
+function openKnowledgeGraphForIncident(incidentId){
+  _openKG({scope:'incident:'+incidentId, label:'Incident INC-'+String(incidentId).padStart(4,'0')});
+}
+
 async function openKnowledgeGraph(){
   const sel=document.getElementById('aiSitRepRange');
   let qs='';
@@ -10336,29 +10345,43 @@ async function openKnowledgeGraph(){
       label=sel.options[sel.selectedIndex].text;
     }
   }
+  return _openKG({qs, label});
+}
+
+async function _openKG(opts){
+  const scope = opts.scope || null;
+  const label = opts.label || 'last 24h';
+  let qs = opts.qs || '';
+  if(scope){
+    qs = '?scope='+encodeURIComponent(scope);
+  }
+  const vizW = Math.min(window.innerWidth - 80, 1100);
+  const vizH = 580;
   const overlay=document.createElement('div');
   overlay.className='modal-overlay';
-  overlay.onclick=e=>{if(e.target===overlay)overlay.remove();};
-  // Use FIXED pixel dimensions on the SVG container to guarantee non-zero
-  // measurements regardless of flex/modal-animation ordering.
-  const vizW = Math.min(window.innerWidth - 80, 1050);
-  const vizH = 560;
+  overlay.onclick=e=>{if(e.target===overlay){window._kg=null;overlay.remove();}};
   overlay.innerHTML=`<div class="modal" style="max-width:${vizW+40}px;width:auto;overflow:hidden;">
-    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px;flex-wrap:wrap;">
       <h2 style="margin:0;">🧠 Knowledge Graph — ${esc(label)}</h2>
-      <span id="kgStats" style="font-size:11px;color:var(--text-dim);"></span>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <button class="btn btn-sm" id="kgToggleTimeline" onclick="_kgToggleTimeline()" title="Arrange incidents left-to-right by created_at">Timeline</button>
+        <button class="btn btn-sm" onclick="_kgClearPath()" title="Clear selection / path highlight">Clear</button>
+        <button class="btn btn-sm" onclick="_kgExportPng()" title="Save as PNG">PNG</button>
+      </div>
     </div>
-    <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px;">Nodes: assets · incidents · signatures · IOCs · MITRE techniques. Drag to reposition, mouse-wheel to zoom, hover for details.</div>
-    <div id="kgViz" style="width:${vizW}px;height:${vizH}px;border:1px solid var(--border);border-radius:6px;background:#0b1220;overflow:hidden;">
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;" id="kgHelp">
+      <span id="kgStats"></span> · Click node for actions · Shift-click 2 nodes to highlight the path between them · Legend chips toggle visibility · Mouse-wheel to zoom
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;" id="kgFilters"></div>
+    <div id="kgViz" style="width:${vizW}px;height:${vizH}px;border:1px solid var(--border);border-radius:6px;background:#0b1220;overflow:hidden;position:relative;">
       <div style="text-align:center;padding:60px;color:#94a3b8;font-size:11px;">Loading graph…</div>
     </div>
     <div class="actions" style="margin-top:10px;text-align:right;">
-      <button class="btn" onclick="this.closest('.modal-overlay').remove()">Close</button>
+      <button class="btn" onclick="window._kg=null;this.closest('.modal-overlay').remove()">Close</button>
     </div>
   </div>`;
   document.body.appendChild(overlay);
 
-  // Bypass the shared api() cache and error-swallow — we want live errors.
   let g;
   try{
     const resp=await fetch('/api/graph/knowledge'+qs, {
@@ -10391,20 +10414,16 @@ async function openKnowledgeGraph(){
   _kgRender(g, vizW, vizH);
 }
 
+const KG_COLORS = {asset:'#3b82f6', incident:'#dc2626', signature:'#f59e0b', ioc:'#8b5cf6', technique:'#10b981'};
+
 function _kgRender(g, w, h){
   const container=document.getElementById('kgViz');
   if(!container) return;
   container.innerHTML='';
   w = w || 900; h = h || 520;
-  const colorMap={asset:'#3b82f6', incident:'#dc2626', signature:'#f59e0b', ioc:'#8b5cf6', technique:'#10b981'};
 
   // Deep-clone AND remap edge property names — D3's forceLink hard-codes
-  // .source / .target, but the backend emits .from / .to. Without this
-  // remap, D3 sees undefined endpoints, positions everything at (0,0),
-  // and the canvas appears empty.
-  // Also: D3 mutates whatever we hand it (adds .x/.y/.vx/.vy, and replaces
-  // string IDs with node object references), so we clone first to keep the
-  // API response reusable.
+  // .source / .target, but the backend emits .from / .to.
   const nodes = g.nodes.map(n => Object.assign({}, n));
   const edges = g.edges.map(e => ({...e, source: e.from, target: e.to}));
 
@@ -10412,40 +10431,76 @@ function _kgRender(g, w, h){
     .attr('width', w).attr('height', h)
     .attr('viewBox', `0 0 ${w} ${h}`)
     .style('display','block').style('background','#0b1220');
-
   const g_root=svg.append('g');
-  svg.call(d3.zoom().scaleExtent([0.2, 4]).on('zoom', (ev)=>g_root.attr('transform', ev.transform)));
+  svg.call(d3.zoom().scaleExtent([0.15, 5]).on('zoom', (ev)=>g_root.attr('transform', ev.transform)));
 
-  const link=g_root.append('g')
-    .attr('stroke','#64748b').attr('stroke-opacity',0.5)
+  const linkSel=g_root.append('g')
+    .attr('stroke-opacity',0.5)
     .selectAll('line').data(edges).join('line')
+    .attr('stroke', d => d.kind==='attacker' ? '#ef4444' : d.kind==='victim' ? '#f59e0b' : d.kind==='has_ioc' ? '#8b5cf6' : d.kind==='uses_technique' ? '#10b981' : '#64748b')
     .attr('stroke-width', d => Math.max(1, Math.min(5, Math.log2((d.weight||1)+1))));
+  // Edge tooltip
+  linkSel.append('title').text(d => `${d.kind || 'edge'} (weight ${d.weight||1})`);
 
-  let sim; // forward-declared for drag handlers
+  // ── Node rendering ───────────────────────────────────────────
+  let sim;
   const nodeSel=g_root.append('g').selectAll('g').data(nodes).join('g')
-    .style('cursor','grab')
+    .attr('data-id', d => d.id)
+    .style('cursor','pointer')
     .call(d3.drag()
       .on('start',(ev,d)=>{if(!ev.active && sim) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y;})
       .on('drag',(ev,d)=>{d.fx=ev.x; d.fy=ev.y;})
       .on('end',(ev,d)=>{if(!ev.active && sim) sim.alphaTarget(0); d.fx=null; d.fy=null;})
-    );
-  nodeSel.append('circle')
-    .attr('r', d => d.type==='incident'?9:d.type==='asset'?7:5)
-    .attr('fill', d => colorMap[d.type]||'#94a3b8')
-    .attr('stroke','#0b1220').attr('stroke-width',1.5)
-    .append('title').text(d => `${d.type}: ${d.label}\n${JSON.stringify(d.meta,null,2)}`);
-  nodeSel.append('text').text(d => (d.label||'').slice(0,28))
-    .attr('x',10).attr('y',4)
+    )
+    .on('click', (ev, d) => {
+      ev.stopPropagation();
+      if(ev.shiftKey){
+        _kgOnShiftClick(d);
+      } else {
+        _kgOpenContextMenu(ev, d);
+      }
+    });
+  // Shape selector: registered assets = circle; unregistered = diamond
+  nodeSel.each(function(d){
+    const g=d3.select(this);
+    const r = _kgNodeSize(d);
+    if(d.type==='asset' && d.meta && d.meta.registered===false){
+      // Diamond for unregistered
+      g.append('polygon')
+        .attr('points', `0,${-r} ${r},0 0,${r} ${-r},0`)
+        .attr('fill', KG_COLORS.asset)
+        .attr('stroke','#0b1220').attr('stroke-width',1.5);
+    } else if(d.type==='asset' && d.meta && d.meta.business_critical){
+      // Star for business-critical asset
+      const s=r*1.4;
+      const pts = [];
+      for(let i=0;i<10;i++){
+        const rr = (i%2===0)?s:s*0.45;
+        const th = (Math.PI*i)/5 - Math.PI/2;
+        pts.push(`${rr*Math.cos(th)},${rr*Math.sin(th)}`);
+      }
+      g.append('polygon').attr('points', pts.join(' '))
+        .attr('fill', '#fbbf24')
+        .attr('stroke','#0b1220').attr('stroke-width',1.5);
+    } else {
+      g.append('circle').attr('r', r)
+        .attr('fill', KG_COLORS[d.type]||'#94a3b8')
+        .attr('stroke','#0b1220').attr('stroke-width',1.5);
+    }
+    g.append('title').text(`${d.type}: ${d.label}\n${JSON.stringify(d.meta,null,2)}`);
+  });
+  nodeSel.append('text').text(d => (d.label||'').slice(0,32))
+    .attr('x', d => _kgNodeSize(d)+3).attr('y',4)
     .style('font-size','10px').style('fill','#e2e8f0').style('pointer-events','none')
     .style('paint-order','stroke').style('stroke','#0b1220').style('stroke-width','3px');
 
   sim = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(edges).id(d => d.id).distance(80).strength(0.4))
-    .force('charge', d3.forceManyBody().strength(-220))
+    .force('link', d3.forceLink(edges).id(d => d.id).distance(90).strength(0.4))
+    .force('charge', d3.forceManyBody().strength(-260))
     .force('center', d3.forceCenter(w/2, h/2))
-    .force('collide', d3.forceCollide(24))
+    .force('collide', d3.forceCollide(28))
     .on('tick', () => {
-      link
+      linkSel
         .attr('x1', d => (d.source && typeof d.source==='object') ? d.source.x : 0)
         .attr('y1', d => (d.source && typeof d.source==='object') ? d.source.y : 0)
         .attr('x2', d => (d.target && typeof d.target==='object') ? d.target.x : 0)
@@ -10453,16 +10508,244 @@ function _kgRender(g, w, h){
       nodeSel.attr('transform', d => `translate(${d.x||0},${d.y||0})`);
     });
 
-  // In-SVG legend, non-scaling (attached to svg not g_root)
-  const legend=svg.append('g').attr('transform','translate(12,12)');
-  const types = Object.keys(colorMap);
-  legend.append('rect').attr('width',110).attr('height', types.length*18+8)
-    .attr('fill','#0f172a').attr('stroke','#334155').attr('rx',4);
-  types.forEach((type,i) => {
-    legend.append('circle').attr('cx',14).attr('cy',14+i*18).attr('r',5).attr('fill',colorMap[type]);
-    legend.append('text').attr('x',26).attr('y',18+i*18).text(type)
-      .style('font-size','10px').style('fill','#e2e8f0');
+  // ── Interactive legend (click to toggle type visibility) ─────
+  const filters = document.getElementById('kgFilters');
+  filters.innerHTML='';
+  const visible = {asset:true, incident:true, signature:true, ioc:true, technique:true};
+  Object.keys(KG_COLORS).forEach(type => {
+    const count = nodes.filter(n=>n.type===type).length;
+    if(count===0) return;
+    const chip = document.createElement('button');
+    chip.className='btn btn-sm';
+    chip.style.cssText=`background:${KG_COLORS[type]};color:#0b1220;border:none;font-weight:700;font-size:10px;padding:3px 8px;`;
+    chip.textContent = `${type} (${count})`;
+    chip.dataset.type = type;
+    chip.dataset.on = 'true';
+    chip.onclick=()=>{
+      visible[type] = !visible[type];
+      chip.dataset.on = String(visible[type]);
+      chip.style.opacity = visible[type] ? '1' : '0.35';
+      nodeSel.style('display', d => visible[d.type] ? '' : 'none');
+      linkSel.style('display', d => {
+        const st = d.source && typeof d.source==='object' ? d.source.type : null;
+        const tt = d.target && typeof d.target==='object' ? d.target.type : null;
+        return (visible[st] && visible[tt]) ? '' : 'none';
+      });
+    };
+    filters.appendChild(chip);
   });
+
+  // Star / diamond quick-legend
+  const shapeHint=document.createElement('span');
+  shapeHint.style.cssText='font-size:10px;color:var(--text-dim);margin-left:8px;';
+  shapeHint.innerHTML='★ = business-critical asset · ◇ = unregistered IP';
+  filters.appendChild(shapeHint);
+
+  // Stash state for other helpers (Timeline / Path / PNG / context menu)
+  window._kg = {
+    svg, g_root, sim, nodeSel, linkSel, nodes, edges, w, h,
+    mode: 'force', pathSelection: [],
+  };
+}
+
+function _kgNodeSize(d){
+  if(d.type==='incident'){
+    const sev = (d.meta && d.meta.severity) || '';
+    return sev==='critical' ? 13 : sev==='high' ? 10 : sev==='medium' ? 8 : sev==='low' ? 6 : 8;
+  }
+  if(d.type==='asset') return d.meta && d.meta.business_critical ? 9 : 7;
+  return 5;
+}
+
+// ── Context menu on node click ────────────────────────────────
+function _kgOpenContextMenu(ev, d){
+  // Remove any previously-open menus
+  document.querySelectorAll('.kg-ctx-menu').forEach(m=>m.remove());
+  const menu = document.createElement('div');
+  menu.className='kg-ctx-menu';
+  menu.style.cssText = `position:fixed;top:${ev.clientY}px;left:${ev.clientX}px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 0;z-index:10000;box-shadow:0 4px 12px rgba(0,0,0,.4);min-width:180px;`;
+  const items = [];
+  items.push({label:`<strong>${esc(d.label)}</strong>`, disabled:true});
+  items.push({label:`<span style="font-size:10px;color:var(--text-dim);">${esc(d.type)}</span>`, disabled:true});
+  items.push({sep:true});
+  if(d.type==='incident' && d.meta && d.meta.incident_id){
+    items.push({label:'Open incident', action:()=>{document.querySelectorAll('.modal-overlay').forEach(o=>o.remove());navigateTo('incidents');pageLoaded['incidents']=false;loadIncidents();setTimeout(()=>{ if(typeof showIncidentDetail==='function') showIncidentDetail(d.meta.incident_id); },500);}});
+    items.push({label:'Scope graph to this incident', action:()=>{document.querySelectorAll('.modal-overlay').forEach(o=>o.remove());openKnowledgeGraphForIncident(d.meta.incident_id);}});
+  }
+  if(d.type==='asset' && d.meta && d.meta.ip){
+    items.push({label:'Investigate this IP', action:()=>{document.querySelectorAll('.modal-overlay').forEach(o=>o.remove());navigateTo('investigate', d.meta.ip);}});
+  }
+  if(d.type==='signature' && d.meta && d.meta.sid){
+    items.push({label:'Show rule text', action:()=>{if(typeof _showRuleText==='function') _showRuleText(d.meta.sid);}});
+  }
+  if(d.type==='technique' && d.meta && d.meta.technique_id){
+    items.push({label:'View on MITRE ATT&CK', action:()=>{window.open('https://attack.mitre.org/techniques/'+d.meta.technique_id.replace('.','/'), '_blank');}});
+  }
+  items.push({sep:true});
+  items.push({label:'Copy id', action:()=>{navigator.clipboard.writeText(d.id);showToast('Copied '+d.id,'success',2000);}});
+  items.push({label:'Close', action:()=>menu.remove()});
+  items.forEach(item=>{
+    if(item.sep){menu.appendChild(document.createElement('hr'));return;}
+    const el=document.createElement('div');
+    el.style.cssText=`padding:5px 12px;cursor:${item.disabled?'default':'pointer'};font-size:11px;color:var(--text);`;
+    el.innerHTML=item.label;
+    if(!item.disabled){
+      el.onmouseover=()=>el.style.background='var(--bg)';
+      el.onmouseout=()=>el.style.background='';
+      el.onclick=()=>{item.action();menu.remove();};
+    }
+    menu.appendChild(el);
+  });
+  document.body.appendChild(menu);
+  // Dismiss on any outside click
+  setTimeout(()=>{document.addEventListener('click',function _close(){menu.remove();document.removeEventListener('click',_close);},{once:true});},10);
+}
+
+// ── Path highlight (shift-click 2 nodes) ─────────────────────
+function _kgOnShiftClick(d){
+  if(!window._kg) return;
+  const state=window._kg;
+  state.pathSelection.push(d.id);
+  if(state.pathSelection.length===1){
+    showToast('Selected '+d.id+'. Shift-click another node to highlight the path.','info',3500);
+    _kgHighlightNode(d.id, '#fbbf24');
+  } else if(state.pathSelection.length===2){
+    const [a,b] = state.pathSelection;
+    state.pathSelection = [];
+    const path = _kgFindPath(a, b);
+    if(!path){
+      showToast('No path exists between those two nodes','warning',3500);
+      _kgClearHighlights();
+    } else {
+      _kgHighlightPath(path);
+      showToast('Path: '+path.length+' hops. Click Clear to reset.','success',4000);
+    }
+  }
+}
+function _kgFindPath(startId, endId){
+  const state=window._kg; if(!state) return null;
+  // BFS on the undirected edge list
+  const adj = new Map();
+  state.edges.forEach(e=>{
+    const s = typeof e.source==='object'?e.source.id:e.source;
+    const t = typeof e.target==='object'?e.target.id:e.target;
+    if(!adj.has(s)) adj.set(s,[]);
+    if(!adj.has(t)) adj.set(t,[]);
+    adj.get(s).push(t); adj.get(t).push(s);
+  });
+  const prev = new Map();
+  const q = [startId];
+  prev.set(startId, null);
+  while(q.length){
+    const cur = q.shift();
+    if(cur===endId) break;
+    for(const nb of (adj.get(cur)||[])){
+      if(!prev.has(nb)){prev.set(nb, cur); q.push(nb);}
+    }
+  }
+  if(!prev.has(endId)) return null;
+  const path = []; let c = endId;
+  while(c!==null){path.unshift(c); c=prev.get(c);}
+  return path;
+}
+function _kgHighlightPath(pathIds){
+  const state=window._kg; if(!state) return;
+  const inPath = new Set(pathIds);
+  state.nodeSel.style('opacity', d => inPath.has(d.id) ? 1 : 0.15);
+  state.linkSel.style('opacity', d => {
+    const s = typeof d.source==='object'?d.source.id:d.source;
+    const t = typeof d.target==='object'?d.target.id:d.target;
+    const idxS=pathIds.indexOf(s), idxT=pathIds.indexOf(t);
+    // edge is in the path if the two ids are consecutive
+    return (idxS>=0 && idxT>=0 && Math.abs(idxS-idxT)===1) ? 1 : 0.06;
+  }).attr('stroke-width', d => {
+    const s = typeof d.source==='object'?d.source.id:d.source;
+    const t = typeof d.target==='object'?d.target.id:d.target;
+    const idxS=pathIds.indexOf(s), idxT=pathIds.indexOf(t);
+    return (idxS>=0 && idxT>=0 && Math.abs(idxS-idxT)===1) ? 4 : 1;
+  });
+}
+function _kgHighlightNode(nodeId, color){
+  const state=window._kg; if(!state) return;
+  state.nodeSel.filter(d=>d.id===nodeId).selectAll('circle,polygon').attr('stroke', color).attr('stroke-width', 3);
+}
+function _kgClearHighlights(){
+  const state=window._kg; if(!state) return;
+  state.nodeSel.style('opacity', 1).selectAll('circle,polygon').attr('stroke','#0b1220').attr('stroke-width',1.5);
+  state.linkSel.style('opacity', 0.5).attr('stroke-width', d=>Math.max(1, Math.min(5, Math.log2((d.weight||1)+1))));
+}
+function _kgClearPath(){
+  if(window._kg) window._kg.pathSelection = [];
+  _kgClearHighlights();
+}
+
+// ── Timeline mode (P3) ──────────────────────────────────────
+function _kgToggleTimeline(){
+  const state = window._kg;
+  if(!state) return;
+  const btn = document.getElementById('kgToggleTimeline');
+  if(state.mode==='timeline'){
+    // Back to force
+    state.mode='force';
+    if(btn){btn.style.background=''; btn.textContent='Timeline';}
+    state.nodes.forEach(n=>{n.fx=null; n.fy=null;});
+    state.sim.force('x', null).force('y', null).alpha(0.6).restart();
+    return;
+  }
+  state.mode='timeline';
+  if(btn){btn.style.background='var(--accent)'; btn.textContent='Timeline ✓';}
+  // Pin nodes with created_at by timestamp; others get default X.
+  const withTime = state.nodes.filter(n=>n.meta && n.meta.created_at);
+  if(!withTime.length){
+    showToast('No nodes have timestamps to arrange on a timeline','warning',3500);
+    state.mode='force';
+    if(btn){btn.style.background=''; btn.textContent='Timeline';}
+    return;
+  }
+  const times = withTime.map(n => new Date(n.meta.created_at).getTime()).filter(t=>!isNaN(t));
+  const tMin = Math.min(...times), tMax = Math.max(...times);
+  const range = tMax - tMin || 1;
+  const padL = 60, padR = 40;
+  state.nodes.forEach(n=>{
+    if(n.meta && n.meta.created_at){
+      const t = new Date(n.meta.created_at).getTime();
+      if(!isNaN(t)){
+        const x = padL + ((t - tMin) / range) * (state.w - padL - padR);
+        n.fx = x; // pin X
+      }
+    }
+  });
+  state.sim.alpha(0.9).restart();
+}
+
+// ── PNG export (P3) ─────────────────────────────────────────
+function _kgExportPng(){
+  const state = window._kg;
+  if(!state) return;
+  const svgEl = state.svg.node();
+  const serializer = new XMLSerializer();
+  let svgStr = serializer.serializeToString(svgEl);
+  if(!svgStr.match(/^<svg[^>]+xmlns=/)) svgStr = svgStr.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"');
+  const svgBlob = new Blob([svgStr], {type:'image/svg+xml;charset=utf-8'});
+  const url = URL.createObjectURL(svgBlob);
+  const img = new Image();
+  img.onload = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = state.w * 2; canvas.height = state.h * 2; // 2x for retina
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#0b1220'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    URL.revokeObjectURL(url);
+    canvas.toBlob(blob => {
+      const dlUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = dlUrl; a.download = 'knowledge-graph-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.png';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(dlUrl), 1000);
+    }, 'image/png');
+  };
+  img.onerror = e => { showToast('PNG export failed','error'); URL.revokeObjectURL(url); };
+  img.src = url;
 }
 
 function _aiRenderModelFooter(r){
