@@ -12,8 +12,14 @@
 #   Remove the include line, delete the file, USR2.
 # ═══════════════════════════════════════════════════════════════════════
 
-# Stage 1 — Recon: many TCP SYN packets from one source in 30 seconds
-alert tcp any any -> any any (msg:"NOTICE DEMO Stage 1 — TCP port scan (SYN burst)"; flags:S; threshold:type threshold, track by_src, count 15, seconds 30; classtype:attempted-recon; priority:2; sid:5900001; rev:1;)
+# Stage 1 — Recon: burst of TCP SYN packets to a single destination from one source.
+# rev:2 tightened the pattern because rev:1 fired on any host sending 15 SYNs in 30s,
+# which normal servers (FreeIPA, mgmt boxes) easily do to many different destinations.
+# The by_dst_ip pivot below means we only fire when the SAME src->dst pair sees a burst,
+# which is what a real port scan looks like (one attacker hammering one target across ports).
+# detection_filter is used instead of threshold so the rule fires quickly on bursts
+# (2.5 SYN/sec sustained for 8 s = nmap territory) without accumulating background noise.
+alert tcp any any -> any any (msg:"NOTICE DEMO Stage 1 — TCP port scan (SYN burst)"; flags:S; detection_filter:track by_dst, count 20, seconds 8; classtype:attempted-recon; priority:2; sid:5900001; rev:2;)
 
 # Stage 2 — Brute force: repeated SSH connection attempts from one source
 alert tcp any any -> any 22 (msg:"NOTICE DEMO Stage 2 — SSH brute-force attempt"; flags:S; threshold:type threshold, track by_src, count 5, seconds 60; classtype:attempted-user; priority:1; sid:5900002; rev:1;)
