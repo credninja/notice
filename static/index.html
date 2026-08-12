@@ -10339,13 +10339,17 @@ async function openKnowledgeGraph(){
   const overlay=document.createElement('div');
   overlay.className='modal-overlay';
   overlay.onclick=e=>{if(e.target===overlay)overlay.remove();};
-  overlay.innerHTML=`<div class="modal" style="max-width:1100px;width:95vw;height:90vh;overflow:hidden;display:flex;flex-direction:column;">
+  // Use FIXED pixel dimensions on the SVG container to guarantee non-zero
+  // measurements regardless of flex/modal-animation ordering.
+  const vizW = Math.min(window.innerWidth - 80, 1050);
+  const vizH = 560;
+  overlay.innerHTML=`<div class="modal" style="max-width:${vizW+40}px;width:auto;overflow:hidden;">
     <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
       <h2 style="margin:0;">🧠 Knowledge Graph — ${esc(label)}</h2>
       <span id="kgStats" style="font-size:11px;color:var(--text-dim);"></span>
     </div>
-    <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px;">Nodes: assets · incidents · signatures · IOCs · MITRE techniques. Drag to reposition, hover for details.</div>
-    <div id="kgViz" style="flex:1;min-height:520px;height:520px;border:1px solid var(--border);border-radius:6px;background:#0b1220;position:relative;overflow:hidden;">
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px;">Nodes: assets · incidents · signatures · IOCs · MITRE techniques. Drag to reposition, mouse-wheel to zoom, hover for details.</div>
+    <div id="kgViz" style="width:${vizW}px;height:${vizH}px;border:1px solid var(--border);border-radius:6px;background:#0b1220;overflow:hidden;">
       <div style="text-align:center;padding:60px;color:#94a3b8;font-size:11px;">Loading graph…</div>
     </div>
     <div class="actions" style="margin-top:10px;text-align:right;">
@@ -10354,81 +10358,109 @@ async function openKnowledgeGraph(){
   </div>`;
   document.body.appendChild(overlay);
 
+  // Bypass the shared api() cache and error-swallow — we want live errors.
+  let g;
   try{
-    const g=await api('/api/graph/knowledge'+qs);
-    if(!g||g.error){
-      document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:#ef4444;text-align:center;font-size:11px;">${esc(g?.error||'failed to load')}</div>`;
+    const resp=await fetch('/api/graph/knowledge'+qs, {
+      cache:'no-store',
+      headers:{'Cache-Control':'no-cache','X-Requested-With':'XMLHttpRequest'},
+    });
+    if(!resp.ok){
+      document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:#ef4444;text-align:center;font-size:11px;">HTTP ${resp.status} — ${esc(await resp.text().then(t=>t.slice(0,200)))}</div>`;
       return;
     }
-    const s=g.stats||{};
-    document.getElementById('kgStats').textContent=`${s.node_count||0} nodes · ${s.edge_count||0} edges — ${Object.entries(s.by_type||{}).map(([k,v])=>`${v} ${k}`).join(', ')}`;
-    if(!g.nodes || !g.nodes.length){
-      document.getElementById('kgViz').innerHTML=`<div style="padding:60px;text-align:center;color:#94a3b8;font-size:12px;">No incidents or alert traffic in the selected window.<br>Widen the time range and try again.</div>`;
-      return;
-    }
-    // Give the modal one paint tick so the container has real dimensions
-    requestAnimationFrame(()=>_kgRender(g));
+    g=await resp.json();
   }catch(e){
-    document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:#ef4444;text-align:center;font-size:11px;">${esc(String(e))}</div>`;
+    document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:#ef4444;text-align:center;font-size:11px;">Fetch failed: ${esc(String(e))}</div>`;
+    return;
   }
+  if(!g || g.error){
+    document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:#ef4444;text-align:center;font-size:11px;">${esc(g?.error||'empty response')}</div>`;
+    return;
+  }
+  const s=g.stats||{};
+  document.getElementById('kgStats').textContent=`${s.node_count||0} nodes · ${s.edge_count||0} edges — ${Object.entries(s.by_type||{}).map(([k,v])=>`${v} ${k}`).join(', ')}`;
+  if(!g.nodes || !g.nodes.length){
+    document.getElementById('kgViz').innerHTML=`<div style="padding:60px;text-align:center;color:#94a3b8;font-size:12px;">No incidents or alert traffic in the selected window.<br>Widen the time range and try again.</div>`;
+    return;
+  }
+  if(typeof d3==='undefined'){
+    document.getElementById('kgViz').innerHTML=`<div style="padding:40px;color:#ef4444;text-align:center;font-size:11px;">D3.js not loaded — cannot render</div>`;
+    return;
+  }
+  _kgRender(g, vizW, vizH);
 }
 
-function _kgRender(g){
+function _kgRender(g, w, h){
   const container=document.getElementById('kgViz');
   if(!container) return;
   container.innerHTML='';
-  // Fallback dimensions if the container hasn't been laid out yet
-  const w=Math.max(300, container.clientWidth || 900);
-  const h=Math.max(400, container.clientHeight || 520);
-  if(typeof d3==='undefined'){
-    container.innerHTML='<div style="padding:40px;color:#ef4444;text-align:center;font-size:11px;">D3 not loaded — graph cannot render</div>';
-    return;
-  }
+  w = w || 900; h = h || 520;
   const colorMap={asset:'#3b82f6', incident:'#dc2626', signature:'#f59e0b', ioc:'#8b5cf6', technique:'#10b981'};
-  const svg=d3.select(container).append('svg').attr('width',w).attr('height',h)
-    .style('display','block');
-  // Zoom/pan wrapper
+
+  // Deep-clone AND remap edge property names — D3's forceLink hard-codes
+  // .source / .target, but the backend emits .from / .to. Without this
+  // remap, D3 sees undefined endpoints, positions everything at (0,0),
+  // and the canvas appears empty.
+  // Also: D3 mutates whatever we hand it (adds .x/.y/.vx/.vy, and replaces
+  // string IDs with node object references), so we clone first to keep the
+  // API response reusable.
+  const nodes = g.nodes.map(n => Object.assign({}, n));
+  const edges = g.edges.map(e => ({...e, source: e.from, target: e.to}));
+
+  const svg=d3.select(container).append('svg')
+    .attr('width', w).attr('height', h)
+    .attr('viewBox', `0 0 ${w} ${h}`)
+    .style('display','block').style('background','#0b1220');
+
   const g_root=svg.append('g');
   svg.call(d3.zoom().scaleExtent([0.2, 4]).on('zoom', (ev)=>g_root.attr('transform', ev.transform)));
 
-  const link=g_root.append('g').attr('stroke','#94a3b8').attr('stroke-opacity',0.35).selectAll('line')
-    .data(g.edges).join('line').attr('stroke-width',d=>Math.max(1,Math.min(6,Math.log2((d.weight||1)+1))));
+  const link=g_root.append('g')
+    .attr('stroke','#64748b').attr('stroke-opacity',0.5)
+    .selectAll('line').data(edges).join('line')
+    .attr('stroke-width', d => Math.max(1, Math.min(5, Math.log2((d.weight||1)+1))));
 
-  let sim;
-  const node=g_root.append('g').selectAll('g').data(g.nodes).join('g')
+  let sim; // forward-declared for drag handlers
+  const nodeSel=g_root.append('g').selectAll('g').data(nodes).join('g')
     .style('cursor','grab')
     .call(d3.drag()
-      .on('start',(ev,d)=>{if(!ev.active)sim.alphaTarget(0.3).restart();d.fx=d.x;d.fy=d.y;})
-      .on('drag',(ev,d)=>{d.fx=ev.x;d.fy=ev.y;})
-      .on('end',(ev,d)=>{if(!ev.active)sim.alphaTarget(0);d.fx=null;d.fy=null;})
+      .on('start',(ev,d)=>{if(!ev.active && sim) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y;})
+      .on('drag',(ev,d)=>{d.fx=ev.x; d.fy=ev.y;})
+      .on('end',(ev,d)=>{if(!ev.active && sim) sim.alphaTarget(0); d.fx=null; d.fy=null;})
     );
-  node.append('circle')
-    .attr('r',d=>d.type==='incident'?9:d.type==='asset'?7:5)
-    .attr('fill',d=>colorMap[d.type]||'#94a3b8')
+  nodeSel.append('circle')
+    .attr('r', d => d.type==='incident'?9:d.type==='asset'?7:5)
+    .attr('fill', d => colorMap[d.type]||'#94a3b8')
     .attr('stroke','#0b1220').attr('stroke-width',1.5)
-    .append('title').text(d=>`${d.type}: ${d.label}\n${JSON.stringify(d.meta,null,2)}`);
-  node.append('text').text(d=>(d.label||'').slice(0,28))
+    .append('title').text(d => `${d.type}: ${d.label}\n${JSON.stringify(d.meta,null,2)}`);
+  nodeSel.append('text').text(d => (d.label||'').slice(0,28))
     .attr('x',10).attr('y',4)
     .style('font-size','10px').style('fill','#e2e8f0').style('pointer-events','none')
     .style('paint-order','stroke').style('stroke','#0b1220').style('stroke-width','3px');
 
-  sim=d3.forceSimulation(g.nodes)
-    .force('link',d3.forceLink(g.edges).id(d=>d.id).distance(80).strength(0.4))
-    .force('charge',d3.forceManyBody().strength(-220))
-    .force('center',d3.forceCenter(w/2,h/2))
-    .force('collide',d3.forceCollide(24))
-    .on('tick',()=>{
-      link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
-      node.attr('transform',d=>`translate(${d.x},${d.y})`);
+  sim = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(edges).id(d => d.id).distance(80).strength(0.4))
+    .force('charge', d3.forceManyBody().strength(-220))
+    .force('center', d3.forceCenter(w/2, h/2))
+    .force('collide', d3.forceCollide(24))
+    .on('tick', () => {
+      link
+        .attr('x1', d => (d.source && typeof d.source==='object') ? d.source.x : 0)
+        .attr('y1', d => (d.source && typeof d.source==='object') ? d.source.y : 0)
+        .attr('x2', d => (d.target && typeof d.target==='object') ? d.target.x : 0)
+        .attr('y2', d => (d.target && typeof d.target==='object') ? d.target.y : 0);
+      nodeSel.attr('transform', d => `translate(${d.x||0},${d.y||0})`);
     });
 
-  // Legend (in-SVG, top-left, non-scaling)
+  // In-SVG legend, non-scaling (attached to svg not g_root)
   const legend=svg.append('g').attr('transform','translate(12,12)');
-  legend.append('rect').attr('width',110).attr('height',Object.keys(colorMap).length*18+8)
-    .attr('fill','#0b1220').attr('stroke','#334155').attr('rx',4);
-  Object.entries(colorMap).forEach(([type,col],i)=>{
-    legend.append('circle').attr('cx',12).attr('cy',14+i*18).attr('r',5).attr('fill',col);
-    legend.append('text').attr('x',24).attr('y',18+i*18).text(type)
+  const types = Object.keys(colorMap);
+  legend.append('rect').attr('width',110).attr('height', types.length*18+8)
+    .attr('fill','#0f172a').attr('stroke','#334155').attr('rx',4);
+  types.forEach((type,i) => {
+    legend.append('circle').attr('cx',14).attr('cy',14+i*18).attr('r',5).attr('fill',colorMap[type]);
+    legend.append('text').attr('x',26).attr('y',18+i*18).text(type)
       .style('font-size','10px').style('fill','#e2e8f0');
   });
 }
